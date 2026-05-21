@@ -1,32 +1,57 @@
+import re
+import glob
+import os
+
 from langchain_community.document_loaders import PyPDFLoader
 
 
+def clean_text(text):
+    text = re.sub(r"\n+", "\n", text)
+    text = re.sub(r"\s+", " ", text)
+
+    text = re.sub(
+        r"(\b\w(?:\s\w){2,}\b)",
+        lambda m: m.group(0).replace(" ", ""),
+        text
+    )
+
+    return text.strip()
+
+
 def load_pdf(file_path: str):
-    """
-    Load PDF and return document objects.
-    """
-
     loader = PyPDFLoader(file_path)
-
     documents = loader.load()
+
+    for doc in documents:
+        doc.page_content = clean_text(doc.page_content)
+        doc.metadata["source"] = file_path
+        doc.metadata["file_name"] = os.path.basename(file_path)
 
     return documents
 
 
+def load_all_pdfs(data_dir: str = "data"):
+    pdf_paths = glob.glob(os.path.join(data_dir, "*.pdf"))
+
+    all_documents = []
+
+    for pdf_path in pdf_paths:
+        documents = load_pdf(pdf_path)
+        all_documents.extend(documents)
+
+    return all_documents
+
+
 if __name__ == "__main__":
+    docs = load_all_pdfs("data")
 
-    pdf_path = "data/sample.pdf"
+    print(f"\nTotal Pages Loaded From All PDFs: {len(docs)}\n")
 
-    docs = load_pdf(pdf_path)
+    if docs:
+        print("FIRST PAGE CONTENT:\n")
+        print(docs[0].page_content[:1000])
 
-    print(f"\nTotal Pages Loaded: {len(docs)}\n")
-
-    print("FIRST PAGE CONTENT:\n")
-    print(docs[0].page_content[:1000])
-
-    print("\nMETADATA:\n")
-    print(docs[0].metadata)
-
-    print(type(docs))
-    print(type(docs[0]))
-    print(docs[0])
+        print("\nMETADATA:\n")
+        print(docs[0].metadata)
+    else:
+        print("No PDF files found in data/ folder.")

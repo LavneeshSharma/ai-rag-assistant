@@ -1,11 +1,11 @@
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from uuid import uuid4
 
-from utils.pdf_loader import load_pdf
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
 def chunk_documents(documents):
     """
-    Split documents into smaller chunks.
+    Split documents into chunks and add metadata.
     """
 
     text_splitter = RecursiveCharacterTextSplitter(
@@ -15,14 +15,25 @@ def chunk_documents(documents):
 
     chunks = text_splitter.split_documents(documents)
 
+    for i, chunk in enumerate(chunks):
+
+        chunk.metadata["chunk_id"] = str(uuid4())
+
+        chunk.metadata["document_id"] = (
+            f"{chunk.metadata.get('file_name')}"
+            f"_page_{chunk.metadata.get('page')}"
+        )
+
+        chunk.metadata["chunk_index"] = i
+
     return chunks
 
 
 if __name__ == "__main__":
 
-    pdf_path = "data/sample.pdf"
+    from utils.pdf_loader import load_all_pdfs
 
-    docs = load_pdf(pdf_path)
+    docs = load_all_pdfs("data")
 
     chunks = chunk_documents(docs)
 

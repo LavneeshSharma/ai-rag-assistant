@@ -31,11 +31,27 @@ def format_context(documents):
     return context
 
 
-def create_rag_chain(question):
+def format_sources(documents):
 
+    sources = []
+
+    for doc in documents:
+
+        source = doc.metadata.get("source")
+        page = doc.metadata.get("page_label")
+
+        sources.append(f"{source} - Page {page}")
+
+    unique_sources = list(set(sources))
+
+    return "\n".join(unique_sources)
+
+
+def create_rag_chain(question):
     retrieved_docs = retrieve_documents(question)
 
     context = format_context(retrieved_docs)
+    sources = format_sources(retrieved_docs)
 
     prompt = load_prompt()
 
@@ -51,7 +67,21 @@ def create_rag_chain(question):
 
     response = llm.invoke(final_prompt)
 
-    return response.content
+    if "I could not find this information" in response.content:
+        final_answer = f"""
+Answer:
+{response.content}
+"""
+    else:
+        final_answer = f"""
+Answer:
+{response.content}
+
+Sources:
+{sources}
+"""
+
+    return final_answer
 
 
 if __name__ == "__main__":
@@ -59,7 +89,5 @@ if __name__ == "__main__":
     user_question = "Which project uses clustering algorithms?"
 
     answer = create_rag_chain(user_question)
-
-    print("\nANSWER:\n")
 
     print(answer)

@@ -9,8 +9,8 @@ def chunk_documents(documents):
     """
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100
+        chunk_size=900,
+        chunk_overlap=150
     )
 
     chunks = text_splitter.split_documents(documents)

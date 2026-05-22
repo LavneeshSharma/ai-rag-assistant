@@ -1,14 +1,12 @@
 from sentence_transformers import CrossEncoder
 
+from config.settings import RERANKER_MODEL
 
-reranker_model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+reranker_model = CrossEncoder(RERANKER_MODEL)
 
 
-def rerank_documents(query, documents, top_n=4):
-    """
-    Rerank retrieved documents using a cross-encoder reranker.
-    """
-
+def rerank_documents(query, documents, top_n):
     if not documents:
         return []
 
@@ -24,6 +22,4 @@ def rerank_documents(query, documents, top_n=4):
         reverse=True
     )
 
-    reranked_docs = [doc for doc, score in scored_docs[:top_n]]
-
-    return reranked_docs
+    return [doc for doc, score in scored_docs[:top_n]]

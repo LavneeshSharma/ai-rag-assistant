@@ -2,15 +2,14 @@ from dotenv import load_dotenv
 
 from langchain_ollama import ChatOllama
 from langchain.prompts import PromptTemplate
-
-from chains.retriever import retrieve_documents
+from chains.hybrid_retriever import hybrid_retrieve_documents
+from config.settings import MODEL_NAME
 
 
 load_dotenv()
 
 
 def load_prompt():
-
     with open("prompts/rag_prompt.txt", "r") as file:
         template = file.read()
 
@@ -23,32 +22,22 @@ def load_prompt():
 
 
 def format_context(documents):
-
-    context = "\n\n".join(
-        [doc.page_content for doc in documents]
-    )
-
-    return context
+    return "\n\n".join([doc.page_content for doc in documents])
 
 
 def format_sources(documents):
-
     sources = []
 
     for doc in documents:
-
         source = doc.metadata.get("source")
         page = doc.metadata.get("page_label")
-
         sources.append(f"{source} - Page {page}")
 
-    unique_sources = list(set(sources))
-
-    return "\n".join(unique_sources)
+    return "\n".join(sorted(set(sources)))
 
 
 def create_rag_chain(question):
-    retrieved_docs = retrieve_documents(question)
+    retrieved_docs = hybrid_retrieve_documents(question)
 
     context = format_context(retrieved_docs)
     sources = format_sources(retrieved_docs)
@@ -61,7 +50,7 @@ def create_rag_chain(question):
     )
 
     llm = ChatOllama(
-        model="phi3",
+        model=MODEL_NAME,
         temperature=0
     )
 
@@ -84,10 +73,39 @@ Sources:
     return final_answer
 
 
+def stream_rag_chain(question):
+    retrieved_docs = hybrid_retrieve_documents(question)
+
+    context = format_context(retrieved_docs)
+    sources = format_sources(retrieved_docs)
+
+    prompt = load_prompt()
+
+    final_prompt = prompt.format(
+        context=context,
+        question=question
+    )
+
+    llm = ChatOllama(
+        model=MODEL_NAME,
+        temperature=0
+    )
+
+    print("\nAnswer:\n")
+
+    full_response = ""
+
+    for chunk in llm.stream(final_prompt):
+        print(chunk.content, end="", flush=True)
+        full_response += chunk.content
+
+    if "I could not find this information" not in full_response:
+        print("\n\nSources:")
+        print(sources)
+
+    print()
+
+
 if __name__ == "__main__":
-
-    user_question = "Which project uses clustering algorithms?"
-
-    answer = create_rag_chain(user_question)
-
-    print(answer)
+    user_question = "List the project titles mentioned in the PDF."
+    stream_rag_chain(user_question)

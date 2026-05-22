@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
 from langchain.prompts import PromptTemplate
 
-from chains.retriever import retrieve_documents
+from chains.hybrid_retriever import hybrid_retrieve_documents
 from chains.query_rewriter import rewrite_query
 
 load_dotenv()
@@ -101,7 +101,7 @@ def create_conversational_rag_chain(question):
 
     rewritten_question = rewrite_query(history, question)
 
-    retrieved_docs = retrieve_documents(rewritten_question)
+    retrieved_docs = hybrid_retrieve_documents(rewritten_question)
 
     context = format_context(retrieved_docs)
     sources = format_sources(retrieved_docs)

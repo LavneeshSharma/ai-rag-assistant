@@ -6,14 +6,20 @@ from langchain_community.document_loaders import PyPDFLoader
 
 
 def clean_text(text):
-    text = re.sub(r"\n+", "\n", text)
-    text = re.sub(r"\s+", " ", text)
 
+    # Normalize newlines
+    text = re.sub(r"\n+", "\n", text)
+
+    # Fix spaced letters only:
+    # D a t a -> Data
     text = re.sub(
-        r"(\b\w(?:\s\w){2,}\b)",
-        lambda m: m.group(0).replace(" ", ""),
+        r'\b(?:[A-Za-z]\s){2,}[A-Za-z]\b',
+        lambda x: x.group(0).replace(" ", ""),
         text
     )
+
+    # Normalize spaces
+    text = re.sub(r"[ \t]+", " ", text)
 
     return text.strip()
 

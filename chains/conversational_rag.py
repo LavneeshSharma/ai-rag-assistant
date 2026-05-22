@@ -4,7 +4,7 @@ from langchain_ollama import ChatOllama
 from langchain.prompts import PromptTemplate
 
 from chains.retriever import retrieve_documents
-
+from chains.query_rewriter import rewrite_query
 
 load_dotenv()
 
@@ -99,15 +99,9 @@ def format_chat_history():
 def create_conversational_rag_chain(question):
     history = format_chat_history()
 
-    enhanced_question = f"""
-Previous Conversation:
-{history}
+    rewritten_question = rewrite_query(history, question)
 
-Current Question:
-{question}
-"""
-
-    retrieved_docs = retrieve_documents(enhanced_question)
+    retrieved_docs = retrieve_documents(rewritten_question)
 
     context = format_context(retrieved_docs)
     sources = format_sources(retrieved_docs)
@@ -116,7 +110,7 @@ Current Question:
 
     final_prompt = prompt.format(
         context=context,
-        question=enhanced_question
+        question=rewritten_question
     )
 
     llm = ChatOllama(

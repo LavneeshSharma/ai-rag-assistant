@@ -4,7 +4,6 @@ import os
 
 from langchain_community.document_loaders import PyPDFLoader
 
-
 def clean_text(text):
 
     # Normalize newlines

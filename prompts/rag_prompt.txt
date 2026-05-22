@@ -5,8 +5,9 @@ Rules:
 2. Do NOT use outside knowledge.
 3. If the context partially contains the answer, provide a concise grounded answer using only available information.
 4. Do NOT invent information not present in context.
-5. If the answer is completely unavailable, say:
-   "I could not find this information in the provided PDF."
+5. If the answer is unavailable, output ONLY:
+"I could not find this information in the provided PDF."
+Do not add anything after this sentence.
 6. Keep answers clear, concise, and grounded in the retrieved text.
 
 Context:

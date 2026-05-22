@@ -2,7 +2,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from utils.pdf_loader import load_pdf
 from utils.chunker import chunk_documents
-
+from config.settings import EMBEDDING_MODEL
 
 def create_embeddings():
     """
@@ -10,7 +10,7 @@ def create_embeddings():
     """
 
     embedding_model = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+        model_name=EMBEDDING_MODEL
     )
 
     return embedding_model

@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 
-from langchain_ollama import ChatOllama
+from utils.llm import create_llm
 from langchain.prompts import PromptTemplate
 
 from chains.hybrid_retriever import hybrid_retrieve_documents
@@ -53,10 +53,7 @@ def update_conversation_summary():
         history_text += f"User: {item['question']}\n"
         history_text += f"Assistant: {item['answer']}\n\n"
 
-    llm = ChatOllama(
-        model="phi3",
-        temperature=0
-    )
+    llm = create_llm()
 
     summary_prompt = f"""
 Summarize the following conversation briefly.

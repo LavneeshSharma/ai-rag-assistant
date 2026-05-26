@@ -1,5 +1,5 @@
-from langchain_ollama import ChatOllama
 
+from utils.llm import create_llm
 from config.settings import MODEL_NAME
 
 
@@ -12,11 +12,7 @@ def rewrite_query(chat_history, question):
 
     if not has_vague_word:
         return question
-
-    llm = ChatOllama(
-        model=MODEL_NAME,
-        temperature=0
-    )
+    llm = create_llm()
 
     prompt = f"""
 You are a query rewriting assistant for a PDF RAG system.

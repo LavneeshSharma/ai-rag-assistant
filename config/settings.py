@@ -6,8 +6,8 @@ FETCH_K = 50
 MMR_LAMBDA = 0.7
 TOP_N = 10
 
-MODEL_NAME = "phi3"
-
+MODEL_NAME = "llama-3.3-70b-versatile"
+LLM_PROVIDER = "groq"
 VECTOR_DB_DIR = "vector_store/db"
 DATA_DIR = "data"
 
@@ -15,6 +15,5 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 PARENT_CHUNK_SIZE = 1600
 PARENT_CHUNK_OVERLAP = 250
-
 CHILD_CHUNK_SIZE = 450
 CHILD_CHUNK_OVERLAP = 80

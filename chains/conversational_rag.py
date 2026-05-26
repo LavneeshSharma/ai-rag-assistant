@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 
 from utils.llm import create_llm
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
 from chains.hybrid_retriever import hybrid_retrieve_documents
 from chains.query_rewriter import rewrite_query
@@ -110,10 +110,7 @@ def create_conversational_rag_chain(question):
         question=rewritten_question
     )
 
-    llm = ChatOllama(
-        model="phi3",
-        temperature=0
-    )
+    llm = create_llm()
 
     response = llm.invoke(final_prompt)
 

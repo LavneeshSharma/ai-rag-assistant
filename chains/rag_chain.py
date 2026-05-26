@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 
 from utils.llm import create_llm
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from chains.hybrid_retriever import hybrid_retrieve_documents
 from config.settings import MODEL_NAME
 

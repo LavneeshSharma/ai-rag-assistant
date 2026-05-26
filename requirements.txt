@@ -13,7 +13,7 @@ pypdf
 
 sentence-transformers
 rank-bm25
-
+torchvision
 numpy
 pandas
 scikit-learn

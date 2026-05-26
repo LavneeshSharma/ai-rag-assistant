@@ -13,3 +13,8 @@ DATA_DIR = "data"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+PARENT_CHUNK_SIZE = 1600
+PARENT_CHUNK_OVERLAP = 250
+
+CHILD_CHUNK_SIZE = 450
+CHILD_CHUNK_OVERLAP = 80

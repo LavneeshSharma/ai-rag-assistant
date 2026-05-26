@@ -100,7 +100,7 @@ def create_conversational_rag_chain(question):
     history = format_chat_history()
 
     rewritten_question = rewrite_query(history, question)
-
+    print(f"\nRewritten Query: {rewritten_question}")
     retrieved_docs = hybrid_retrieve_documents(rewritten_question)
 
     context = format_context(retrieved_docs)

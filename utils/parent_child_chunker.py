@@ -1,6 +1,6 @@
 from uuid import uuid4
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitter import RecursiveCharacterTextSplitter
 
 from config.settings import (
     PARENT_CHUNK_SIZE,

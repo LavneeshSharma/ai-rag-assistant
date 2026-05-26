@@ -1,18 +1,23 @@
 streamlit
 python-dotenv
+
 langchain
 langchain-core
 langchain-community
 langchain-chroma
 langchain-groq
+langchain-huggingface
 
 chromadb
 pypdf
 
+sentence-transformers
 rank-bm25
+
 numpy
 pandas
 scikit-learn
+
 protobuf<6
 setuptools
 wheel

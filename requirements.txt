@@ -5,10 +5,10 @@ langchain-core
 langchain-community
 langchain-chroma
 langchain-groq
-langchain-huggingface
+
 chromadb
 pypdf
-sentence-transformers
+
 rank-bm25
 numpy
 pandas

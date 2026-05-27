@@ -1,7 +1,5 @@
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from utils.pdf_loader import load_pdf
-from utils.chunker import chunk_documents
 from config.settings import EMBEDDING_MODEL
 
 def create_embeddings():
@@ -17,6 +15,8 @@ def create_embeddings():
 
 
 if __name__ == "__main__":
+    from utils.pdf_loader import load_pdf
+    from utils.chunker import chunk_documents
 
     pdf_path = "data/sample.pdf"
 
@@ -31,7 +31,5 @@ if __name__ == "__main__":
     embedding_vector = embedding_model.embed_query(sample_text)
 
     print(f"\nChunk Text:\n{sample_text[:300]}")
-
     print(f"\nEmbedding Vector Length: {len(embedding_vector)}")
-
     print(f"\nFirst 10 Values:\n{embedding_vector[:10]}")

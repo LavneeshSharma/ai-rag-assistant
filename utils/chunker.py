@@ -1,6 +1,6 @@
 from uuid import uuid4
 from config.settings import CHUNK_SIZE, CHUNK_OVERLAP
-from langchain_text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 def chunk_documents(documents):

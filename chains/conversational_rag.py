@@ -1,3 +1,5 @@
+import os
+
 from dotenv import load_dotenv
 
 from utils.llm import create_llm
@@ -5,6 +7,7 @@ from langchain_core.prompts import PromptTemplate
 
 from chains.hybrid_retriever import hybrid_retrieve_documents
 from chains.query_rewriter import rewrite_query
+from vector_store.chroma_store import get_active_index_path
 
 load_dotenv()
 
@@ -30,14 +33,26 @@ def format_context(documents):
 
 
 def format_sources(documents):
-    sources = []
+    sources = {}
 
     for doc in documents:
-        source = doc.metadata.get("source")
+        source = doc.metadata.get("file_name") or os.path.basename(
+            doc.metadata.get("source", "")
+        )
         page = doc.metadata.get("page_label")
-        sources.append(f"{source} - Page {page}")
+        if not source or page is None:
+            continue
+        sources.setdefault(source, set()).add(str(page))
 
-    return "\n".join(sorted(set(sources)))
+    formatted = []
+    for source, pages in sorted(sources.items()):
+        page_list = ", ".join(
+            f"Page {page}"
+            for page in sorted(pages, key=lambda p: int(p) if p.isdigit() else p)
+        )
+        formatted.append(f"{source} — {page_list}")
+
+    return "\n".join(formatted)
 
 def update_conversation_summary():
     global conversation_summary
@@ -94,6 +109,13 @@ def format_chat_history():
     return history_text
 
 def create_conversational_rag_chain(question):
+    active_index_path = get_active_index_path()
+    if not active_index_path or not os.path.isdir(active_index_path):
+        return """
+Answer:
+No active index found. Upload and index PDFs first.
+"""
+
     history = format_chat_history()
 
     rewritten_question = rewrite_query(history, question)
@@ -124,8 +146,7 @@ Answer:
 Answer:
 {response.content}
 
-Sources:
-{sources}
+Sources: {sources}
 """
 
     chat_history.append({

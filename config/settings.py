@@ -1,3 +1,5 @@
+import os
+
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
 
@@ -8,8 +10,11 @@ TOP_N = 10
 
 MODEL_NAME = "llama-3.3-70b-versatile"
 LLM_PROVIDER = "groq"
-VECTOR_DB_DIR = "vector_store/db"
-DATA_DIR = "data"
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+VECTOR_DB_DIR = os.path.abspath(os.path.join(BASE_DIR, "vector_store", "db"))
+VECTOR_INDEXES_DIR = os.path.abspath(os.path.join(BASE_DIR, "vector_store", "indexes"))
+ACTIVE_INDEX_FILE = os.path.abspath(os.path.join(BASE_DIR, "vector_store", "active_index.json"))
+DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "data"))
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"

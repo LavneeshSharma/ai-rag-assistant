@@ -1,16 +1,23 @@
+import os
+
 from langchain_chroma import Chroma
 
 from utils.embeddings import create_embeddings
 from chains.reranker import rerank_documents
 from utils.query_classifier import classify_query
-from config.settings import VECTOR_DB_DIR, FETCH_K, MMR_LAMBDA
+from config.settings import FETCH_K, MMR_LAMBDA
+from vector_store.chroma_store import get_active_index_path
 
 
 def load_vector_store():
     embedding_model = create_embeddings()
+    active_index_path = get_active_index_path()
+
+    if not active_index_path or not os.path.isdir(active_index_path):
+        raise RuntimeError("No active Chroma index found. Upload and index PDFs first.")
 
     vector_store = Chroma(
-        persist_directory=VECTOR_DB_DIR,
+        persist_directory=active_index_path,
         embedding_function=embedding_model
     )
 

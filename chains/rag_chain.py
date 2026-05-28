@@ -1,3 +1,5 @@
+import os
+
 from dotenv import load_dotenv
 
 from utils.llm import create_llm
@@ -26,14 +28,26 @@ def format_context(documents):
 
 
 def format_sources(documents):
-    sources = []
+    sources = {}
 
     for doc in documents:
-        source = doc.metadata.get("source")
+        source = doc.metadata.get("file_name") or os.path.basename(
+            doc.metadata.get("source", "")
+        )
         page = doc.metadata.get("page_label")
-        sources.append(f"{source} - Page {page}")
+        if not source or page is None:
+            continue
+        sources.setdefault(source, set()).add(str(page))
 
-    return "\n".join(sorted(set(sources)))
+    formatted = []
+    for source, pages in sorted(sources.items()):
+        page_list = ", ".join(
+            f"Page {page}"
+            for page in sorted(pages, key=lambda p: int(p) if p.isdigit() else p)
+        )
+        formatted.append(f"{source} — {page_list}")
+
+    return "\n".join(formatted)
 
 
 def create_rag_chain(question):
@@ -63,8 +77,7 @@ Answer:
 Answer:
 {response.content}
 
-Sources:
-{sources}
+Sources: {sources}
 """
 
     return final_answer

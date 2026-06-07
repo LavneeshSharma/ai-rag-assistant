@@ -48,8 +48,8 @@ def merge_documents(vector_docs, bm25_docs):
     return merged_docs
 
 
-def hybrid_retrieve_documents(query):
-    vector_store = load_vector_store()
+def hybrid_retrieve_documents(query, active_index_path=None):
+    vector_store = load_vector_store(active_index_path)
 
     query_type = classify_query(query)
 

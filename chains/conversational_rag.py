@@ -7,7 +7,6 @@ from langchain_core.prompts import PromptTemplate
 
 from chains.hybrid_retriever import hybrid_retrieve_documents
 from chains.query_rewriter import rewrite_query
-from vector_store.chroma_store import get_active_index_path
 
 load_dotenv()
 
@@ -89,7 +88,18 @@ Updated Summary:
 
     del chat_history[:-MAX_HISTORY]
 
-def format_chat_history():
+def format_chat_history(chat_messages=None):
+    if chat_messages is not None:
+        recent_messages = chat_messages[-MAX_HISTORY * 2:]
+        if not recent_messages:
+            return "No previous conversation."
+
+        history_text = "Recent Conversation:\n"
+        for message in recent_messages:
+            label = "User" if message.get("role") == "user" else "Assistant"
+            history_text += f"{label}: {message.get('content', '')}\n"
+        return history_text
+
     recent_history = chat_history[-MAX_HISTORY:]
 
     history_text = ""
@@ -108,19 +118,22 @@ def format_chat_history():
 
     return history_text
 
-def create_conversational_rag_chain(question):
-    active_index_path = get_active_index_path()
+def create_conversational_rag_chain(
+    question,
+    active_index_path=None,
+    chat_messages=None,
+):
     if not active_index_path or not os.path.isdir(active_index_path):
         return """
 Answer:
 No active index found. Upload and index PDFs first.
 """
 
-    history = format_chat_history()
+    history = format_chat_history(chat_messages)
 
     rewritten_question = rewrite_query(history, question)
     print(f"\nRewritten Query: {rewritten_question}")
-    retrieved_docs = hybrid_retrieve_documents(rewritten_question)
+    retrieved_docs = hybrid_retrieve_documents(rewritten_question, active_index_path)
 
     context = format_context(retrieved_docs)
     sources = format_sources(retrieved_docs)
@@ -149,12 +162,12 @@ Answer:
 Sources: {sources}
 """
 
-    chat_history.append({
-        "question": question,
-        "answer": response.content
-    })
-
-    update_conversation_summary()
+    if chat_messages is None:
+        chat_history.append({
+            "question": question,
+            "answer": response.content
+        })
+        update_conversation_summary()
 
     return final_answer
 

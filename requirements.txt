@@ -1,5 +1,6 @@
 streamlit
 python-dotenv
+authlib==1.3.2
 
 langchain
 langchain-core

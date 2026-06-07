@@ -2,23 +2,45 @@ import os
 import sys
 import gc
 import hashlib
+import html
 import re
 import time
-import uuid
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
+from dotenv import load_dotenv
+try:
+    from authlib.integrations.requests_client import OAuth2Session
+except ImportError:
+    OAuth2Session = None
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from chains.conversational_rag import create_conversational_rag_chain
-from vector_store.chroma_store import create_vector_store, reset_vector_store
+from vector_store.chroma_store import (
+    create_vector_store,
+    get_active_index_path,
+    reset_vector_store,
+)
+from db.database import (
+    add_document,
+    create_chat as db_create_chat,
+    get_chats,
+    get_documents,
+    get_messages,
+    init_db,
+    remove_document,
+    save_message,
+    upsert_user,
+    update_chat_active_index_path,
+    update_chat_title,
+)
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 from config.settings import DATA_DIR as REL_DATA_DIR
 
 # Ensure backend code that uses relative paths (config.settings) resolves correctly.
 os.chdir(BASE_DIR)
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, REL_DATA_DIR))
 
@@ -33,24 +55,115 @@ st.set_page_config(
 
 # ── Authentication (OAuth hooks for later) ──────────────────────────
 
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+GOOGLE_OAUTH_STATE = "rag_assistant_google_auth"
+
+
+def _secret(name: str) -> Optional[str]:
+    try:
+        value = st.secrets[name]
+    except Exception:
+        value = None
+    if value is None:
+        try:
+            value = st.secrets["google"][name.removeprefix("GOOGLE_").lower()]
+        except Exception:
+            value = None
+    return value or os.environ.get(name)
+
+
+def _google_auth_config() -> Dict[str, Optional[str]]:
+    return {
+        "client_id": _secret("GOOGLE_CLIENT_ID"),
+        "client_secret": _secret("GOOGLE_CLIENT_SECRET"),
+        "redirect_uri": _secret("GOOGLE_REDIRECT_URI") or "http://localhost:8501",
+    }
+
+
+def _google_auth_enabled() -> bool:
+    config = _google_auth_config()
+    return bool(config["client_id"] and config["client_secret"] and OAuth2Session)
+
+
+def _local_fallback_enabled() -> bool:
+    config = _google_auth_config()
+    return not config["client_id"] or not config["client_secret"] or OAuth2Session is None
+
+
 def get_current_user() -> Optional[Dict[str, Any]]:
     """Return authenticated user dict or None."""
     return st.session_state.get("authenticated_user")
 
 
-def login_with_google() -> None:
-    """
-    Placeholder for Google OAuth.
-    Wire streamlit-oauth / authlib here when credentials are configured.
-    """
-    st.session_state.oauth_notice = "Google OAuth not configured yet"
+def _current_user_id() -> str:
+    user = get_current_user() or {}
+    return user.get("id", "local")
+
+
+def _build_google_auth_url() -> Optional[str]:
+    if not _google_auth_enabled():
+        return None
+
+    config = _google_auth_config()
+    st.session_state.oauth_state = GOOGLE_OAUTH_STATE
+    client = OAuth2Session(
+        config["client_id"],
+        config["client_secret"],
+        scope="openid email profile",
+        redirect_uri=config["redirect_uri"],
+    )
+    auth_url, _ = client.create_authorization_url(
+        GOOGLE_AUTH_URL,
+        state=GOOGLE_OAUTH_STATE,
+        prompt="select_account",
+    )
+    return auth_url
+
+
+def _handle_google_callback() -> None:
+    if not _google_auth_enabled():
+        return
+
+    code = st.query_params.get("code")
+    state = st.query_params.get("state")
+    if not code:
+        return
+    if isinstance(state, list):
+        state = state[0] if state else None
+    if state != GOOGLE_OAUTH_STATE:
+        st.session_state.oauth_notice = "Google sign-in state did not match."
+        st.query_params.clear()
+        return
+
+    config = _google_auth_config()
+    client = OAuth2Session(
+        config["client_id"],
+        config["client_secret"],
+        redirect_uri=config["redirect_uri"],
+    )
+    client.fetch_token(GOOGLE_TOKEN_URL, code=code)
+    userinfo = client.get(GOOGLE_USERINFO_URL).json()
+    st.session_state.authenticated_user = upsert_user(
+        userinfo["email"],
+        userinfo.get("name") or userinfo["email"],
+        userinfo.get("picture"),
+    )
+    st.session_state.pop("oauth_state", None)
+    st.query_params.clear()
     st.rerun()
 
 
 def logout_user() -> None:
     """Clear authenticated session."""
     st.session_state.authenticated_user = None
+    st.session_state.active_user_id = None
+    st.session_state.chats = {}
+    st.session_state.current_chat_id = None
+    st.session_state.messages = []
     st.session_state.pop("oauth_notice", None)
+    st.session_state.pop("oauth_state", None)
 
 
 def is_authenticated() -> bool:
@@ -58,16 +171,6 @@ def is_authenticated() -> bool:
 
 
 # ── Session state ───────────────────────────────────────────────────
-
-def _new_chat_record(title: str = "New chat") -> Dict[str, Any]:
-    chat_id = uuid.uuid4().hex[:12]
-    return {
-        "id": chat_id,
-        "title": title,
-        "messages": [],
-        "created_at": datetime.utcnow().isoformat(),
-    }
-
 
 def _chat_title_from_question(question: str) -> str:
     text = " ".join(question.strip().split())
@@ -101,37 +204,68 @@ def _chat_title_from_question(question: str) -> str:
 
 def _persist_current_chat() -> None:
     chat_id = st.session_state.current_chat_id
+    if not chat_id or chat_id not in st.session_state.chats:
+        return
+
+    st.session_state.chats[chat_id]["messages"] = list(st.session_state.messages)
     first_user = next(
         (m["content"] for m in st.session_state.messages if m["role"] == "user"),
         None,
     )
+    if first_user and st.session_state.chats[chat_id]["title"] == "New chat":
+        title = _chat_title_from_question(first_user)
+        st.session_state.chats[chat_id]["title"] = title
+        update_chat_title(chat_id, title, _current_user_id())
 
-    if chat_id and chat_id in st.session_state.chats:
-        st.session_state.chats[chat_id]["messages"] = list(st.session_state.messages)
-        if first_user and st.session_state.chats[chat_id]["title"] == "New chat":
-            st.session_state.chats[chat_id]["title"] = _chat_title_from_question(
-                first_user
-            )
-        return
 
-    if not first_user:
-        return
+def _messages_to_history_pairs(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    pairs = []
+    pending_question = None
 
-    chat = _new_chat_record(_chat_title_from_question(first_user))
-    st.session_state.chats[chat["id"]] = chat
-    st.session_state.current_chat_id = chat["id"]
-    chat_id = chat["id"]
-    st.session_state.chats[chat_id]["messages"] = list(st.session_state.messages)
+    for message in messages:
+        if message.get("role") == "user":
+            pending_question = message.get("content", "")
+        elif message.get("role") == "assistant" and pending_question is not None:
+            pairs.append({
+                "question": pending_question,
+                "answer": message.get("content", ""),
+            })
+            pending_question = None
+
+    return pairs
+
+
+def _ask_current_chat(
+    question: str,
+    active_index_path: Optional[str],
+    previous_messages: List[Dict[str, str]],
+) -> str:
+    if "chat_messages" in create_conversational_rag_chain.__code__.co_varnames:
+        return create_conversational_rag_chain(
+            question,
+            active_index_path,
+            chat_messages=previous_messages,
+        )
+
+    create_conversational_rag_chain.__globals__["chat_history"] = (
+        _messages_to_history_pairs(previous_messages)
+    )
+    create_conversational_rag_chain.__globals__["conversation_summary"] = ""
+    return create_conversational_rag_chain(question, active_index_path)
 
 
 def init_session_state() -> None:
+    init_db()
     defaults = {
         "messages": [],
         "chats": {},
         "current_chat_id": None,
         "uploaded_pdfs": [],
+        "uploaded_pdf_docs": [],
         "show_uploader": False,
         "authenticated_user": None,
+        "active_user_id": None,
+        "oauth_state": None,
         "selected_pdf_ids": [],
         "uploader_key": 0,
         "chat_text_key": 0,
@@ -144,7 +278,57 @@ def init_session_state() -> None:
         if key not in st.session_state:
             st.session_state[key] = value
 
+    _handle_google_callback()
+    if not st.session_state.authenticated_user and _local_fallback_enabled():
+        st.session_state.authenticated_user = upsert_user(
+            "local@session",
+            "Local session",
+            None,
+            user_id="local",
+        )
+    if not is_authenticated():
+        return
+
+    user_id = _current_user_id()
+    if st.session_state.active_user_id != user_id:
+        st.session_state.active_user_id = user_id
+        st.session_state.messages = []
+        st.session_state.chats = {}
+        st.session_state.current_chat_id = None
+        st.session_state.uploaded_pdfs = []
+        st.session_state.uploaded_pdf_docs = []
+
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    db_chats = get_chats(user_id)
+    if db_chats:
+        st.session_state.chats = {
+            chat["id"]: {**chat, "messages": get_messages(chat["id"], user_id)}
+            for chat in db_chats
+        }
+    elif st.session_state.chats:
+        migrated_chats = {}
+        migrated_current_chat_id = None
+        for old_chat_id, old_chat in st.session_state.chats.items():
+            chat = db_create_chat(old_chat.get("title", "New chat"), user_id)
+            messages = []
+            for message in old_chat.get("messages", []):
+                saved = save_message(
+                    chat["id"],
+                    message["role"],
+                    message["content"],
+                    user_id,
+                )
+                messages.append(saved)
+            migrated_chats[chat["id"]] = {**chat, "messages": messages}
+            if old_chat_id == st.session_state.current_chat_id:
+                migrated_current_chat_id = chat["id"]
+        st.session_state.chats = migrated_chats
+        st.session_state.current_chat_id = migrated_current_chat_id
+    else:
+        chat = db_create_chat("New chat", user_id)
+        st.session_state.chats[chat["id"]] = {**chat, "messages": []}
+        st.session_state.current_chat_id = chat["id"]
 
     if (
         st.session_state.current_chat_id is not None
@@ -153,22 +337,35 @@ def init_session_state() -> None:
         st.session_state.current_chat_id = None
         st.session_state.messages = []
 
-    _sync_pdfs_from_disk()
+    if st.session_state.current_chat_id is None and st.session_state.chats:
+        st.session_state.current_chat_id = next(iter(st.session_state.chats))
 
+    if st.session_state.current_chat_id:
+        st.session_state.messages = list(
+            st.session_state.chats[st.session_state.current_chat_id]["messages"]
+        )
 
-def _sync_pdfs_from_disk() -> None:
-    if not os.path.isdir(DATA_DIR):
+    _sync_pdfs_for_current_chat()
+
+def _sync_pdfs_for_current_chat() -> None:
+    chat_id = st.session_state.current_chat_id
+    if not chat_id:
+        st.session_state.uploaded_pdf_docs = []
+        st.session_state.uploaded_pdfs = []
         return
-    on_disk = sorted(f for f in os.listdir(DATA_DIR) if f.lower().endswith(".pdf"))
-    for name in on_disk:
-        if name not in st.session_state.uploaded_pdfs:
-            st.session_state.uploaded_pdfs.append(name)
+    docs = get_documents(chat_id, _current_user_id())
+    st.session_state.uploaded_pdf_docs = docs
+    st.session_state.uploaded_pdfs = [doc["filename"] for doc in docs]
 
 
 def create_new_chat() -> None:
     _persist_current_chat()
-    st.session_state.current_chat_id = None
+    chat = db_create_chat("New chat", _current_user_id())
+    st.session_state.chats[chat["id"]] = {**chat, "messages": []}
+    st.session_state.current_chat_id = chat["id"]
     st.session_state.messages = []
+    st.session_state.uploaded_pdf_docs = []
+    st.session_state.uploaded_pdfs = []
 
 
 def switch_chat(chat_id: str) -> None:
@@ -178,7 +375,9 @@ def switch_chat(chat_id: str) -> None:
         return
     _persist_current_chat()
     st.session_state.current_chat_id = chat_id
-    st.session_state.messages = list(st.session_state.chats[chat_id]["messages"])
+    st.session_state.messages = get_messages(chat_id, _current_user_id())
+    st.session_state.chats[chat_id]["messages"] = list(st.session_state.messages)
+    _sync_pdfs_for_current_chat()
 
 
 def clear_current_chat() -> None:
@@ -190,37 +389,55 @@ def save_uploaded_files(uploaded_files: Optional[List[Any]]) -> bool:
     if not uploaded_files:
         return False
 
-    new_files = False
+    changed = False
+    existing_docs = {
+        doc["filename"]
+        for doc in get_documents(
+            st.session_state.current_chat_id,
+            _current_user_id(),
+        )
+    }
     for uf in uploaded_files:
         name = uf.name
         if not name.lower().endswith(".pdf"):
             continue
         save_path = os.path.join(DATA_DIR, name)
-        # Prevent duplicates across both session and disk state.
-        if name in st.session_state.uploaded_pdfs or os.path.exists(save_path):
+        if name in existing_docs:
             continue
-        with open(save_path, "wb") as f:
-            f.write(uf.getbuffer())
-        st.session_state.uploaded_pdfs.append(name)
-        new_files = True
+        if not os.path.exists(save_path):
+            with open(save_path, "wb") as f:
+                f.write(uf.getbuffer())
+        add_document(
+            st.session_state.current_chat_id,
+            name,
+            save_path,
+            _current_user_id(),
+        )
+        existing_docs.add(name)
+        changed = True
 
-    if new_files:
-       st.session_state.needs_reindex = True
-       st.session_state.uploader_key += 1
+    if changed:
+        _sync_pdfs_for_current_chat()
+        st.session_state.needs_reindex = True
+        st.session_state.uploader_key += 1
 
-    return new_files
+    return changed
 
 
 
 def remove_pdf(filename: str) -> None:
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    if filename in st.session_state.uploaded_pdfs:
-        st.session_state.uploaded_pdfs.remove(filename)
+    document = next(
+        (
+            doc for doc in st.session_state.uploaded_pdf_docs
+            if doc["filename"] == filename
+        ),
+        None,
+    )
+    if document:
+        remove_document(document["id"], _current_user_id())
+    _sync_pdfs_for_current_chat()
     if filename in st.session_state.selected_pdf_ids:
         st.session_state.selected_pdf_ids.remove(filename)
-    _clear_vector_refs()
     st.session_state.needs_reindex = True
 
 
@@ -247,10 +464,24 @@ def safe_reindex() -> bool:
         gc.collect()
         time.sleep(0.3)
         with st.spinner("Documents changed. Re-indexing..."):
-            if st.session_state.uploaded_pdfs:
-                create_vector_store()
+            docs = get_documents(
+                st.session_state.current_chat_id,
+                _current_user_id(),
+            )
+            if docs:
+                create_vector_store(pdf_paths=[doc["file_path"] for doc in docs])
+                active_index_path = get_active_index_path()
             else:
                 reset_vector_store()
+                active_index_path = None
+            update_chat_active_index_path(
+                st.session_state.current_chat_id,
+                active_index_path,
+                _current_user_id(),
+            )
+            st.session_state.chats[st.session_state.current_chat_id][
+                "active_index_path"
+            ] = active_index_path
         st.session_state.needs_reindex = False
         return True
     finally:
@@ -383,6 +614,10 @@ CUSTOM_CSS = """
         background: #e8605f; color: #fff;
         display: flex; align-items: center; justify-content: center;
         font-size: 12px; font-weight: 600;
+    }
+    .sb-avatar-img {
+        width: 28px; height: 28px; border-radius: 50%;
+        object-fit: cover; display: block;
     }
 
     .main .block-container {
@@ -538,6 +773,27 @@ CUSTOM_CSS = """
 
 # ── UI components ─────────────────────────────────────────────────────
 
+def render_auth_gate() -> None:
+    st.markdown(
+        """
+        <div class="empty-state">
+            <div class="empty-title">Sign in to continue</div>
+            <div class="empty-sub">Use your Google account to keep chats private.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    auth_url = _build_google_auth_url()
+    if st.session_state.get("oauth_notice"):
+        st.warning(st.session_state.oauth_notice)
+    if auth_url:
+        _, center, _ = st.columns([0.32, 0.36, 0.32])
+        with center:
+            st.link_button("Continue with Google", auth_url, use_container_width=True)
+    else:
+        st.info("Google OAuth is not configured. Local fallback mode is active.")
+
+
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown(
@@ -593,13 +849,37 @@ def render_sidebar() -> None:
         st.markdown('<div class="sb-spacer"></div>', unsafe_allow_html=True)
 
         st.markdown('<div class="sb-profile-box">', unsafe_allow_html=True)
+        user = get_current_user() or {}
+        name = user.get("name") or "Local session"
+        email = user.get("email") or "Local session"
+        avatar_url = user.get("avatar_url")
+        initials = "".join(part[:1] for part in name.split()[:2]).upper() or "U"
         left, right = st.columns([0.22, 0.78], gap="small")
         with left:
-            st.markdown('<div class="sb-avatar">LS</div>', unsafe_allow_html=True)
+            if avatar_url:
+                st.markdown(
+                    f'<img class="sb-avatar-img" src="{html.escape(avatar_url)}" />',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="sb-avatar">{html.escape(initials)}</div>',
+                    unsafe_allow_html=True,
+                )
         with right:
-            st.markdown('<div class="sb-user-name">Lavneesh Sharma</div>', unsafe_allow_html=True)
-            st.markdown('<div class="sb-user-email">Local session</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="sb-user-name">{html.escape(name)}</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div class="sb-user-email">{html.escape(email)}</div>',
+                unsafe_allow_html=True,
+            )
         st.markdown("</div>", unsafe_allow_html=True)
+        if not _local_fallback_enabled():
+            if st.button("Sign out", key="sidebar_sign_out", use_container_width=True):
+                logout_user()
+                st.rerun()
 
 
 def render_chat() -> None:
@@ -684,6 +964,12 @@ def render_input_area() -> None:
             return
 
         st.session_state.messages.append({"role": "user", "content": user_question})
+        save_message(
+            st.session_state.current_chat_id,
+            "user",
+            user_question,
+            _current_user_id(),
+        )
         _persist_current_chat()
 
         with st.chat_message("user"):
@@ -691,10 +977,22 @@ def render_input_area() -> None:
 
         with st.chat_message("assistant"):
             with st.spinner("Searching…"):
-                response = create_conversational_rag_chain(user_question)
+                response = _ask_current_chat(
+                    user_question,
+                    st.session_state.chats[st.session_state.current_chat_id].get(
+                        "active_index_path"
+                    ),
+                    st.session_state.messages[:-1],
+                )
             st.markdown(response)
 
         st.session_state.messages.append({"role": "assistant", "content": response})
+        save_message(
+            st.session_state.current_chat_id,
+            "assistant",
+            response,
+            _current_user_id(),
+        )
         _persist_current_chat()
         st.session_state.chat_text_key += 1
         st.rerun()
@@ -703,6 +1001,9 @@ def render_input_area() -> None:
 def main() -> None:
     init_session_state()
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    if not is_authenticated():
+        render_auth_gate()
+        return
     render_sidebar()
     if st.session_state.needs_reindex:
         safe_reindex()

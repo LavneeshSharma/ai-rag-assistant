@@ -9,9 +9,9 @@ from config.settings import FETCH_K, MMR_LAMBDA
 from vector_store.chroma_store import get_active_index_path
 
 
-def load_vector_store():
+def load_vector_store(active_index_path=None):
     embedding_model = create_embeddings()
-    active_index_path = get_active_index_path()
+    active_index_path = active_index_path or get_active_index_path()
 
     if not active_index_path or not os.path.isdir(active_index_path):
         raise RuntimeError("No active Chroma index found. Upload and index PDFs first.")
@@ -24,8 +24,8 @@ def load_vector_store():
     return vector_store
 
 
-def retrieve_documents(query):
-    vector_store = load_vector_store()
+def retrieve_documents(query, active_index_path=None):
+    vector_store = load_vector_store(active_index_path)
 
     query_type = classify_query(query)
 
@@ -56,8 +56,8 @@ def retrieve_documents(query):
     return reranked_docs
 
 
-def retrieve_documents_with_scores(query, k=4):
-    vector_store = load_vector_store()
+def retrieve_documents_with_scores(query, k=4, active_index_path=None):
+    vector_store = load_vector_store(active_index_path)
 
     results = vector_store.similarity_search_with_score(
         query=query,

@@ -7,7 +7,14 @@ from config.settings import RERANKER_MODEL
 from utils.tracing import record_trace_step, serialize_document
 
 
-reranker_model = CrossEncoder(RERANKER_MODEL)
+reranker_model = None
+
+
+def get_reranker_model():
+    global reranker_model
+    if reranker_model is None:
+        reranker_model = CrossEncoder(RERANKER_MODEL)
+    return reranker_model
 
 
 def rerank_documents(query, documents, top_n):
@@ -23,7 +30,7 @@ def rerank_documents(query, documents, top_n):
     started_at = time.perf_counter()
     pairs = [(query, doc.page_content) for doc in documents]
 
-    scores = reranker_model.predict(pairs)
+    scores = get_reranker_model().predict(pairs)
 
     scored_docs = list(zip(documents, scores))
 

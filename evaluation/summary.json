@@ -1,0 +1,24 @@
+{
+  "dataset_path": "/Users/lavneesh/ai-rag-project/copilot/evaluation/eval_dataset.json",
+  "results_path": "/Users/lavneesh/ai-rag-project/copilot/evaluation/results.json",
+  "eval_index_path": "/Users/lavneesh/ai-rag-project/copilot/vector_store/eval_index",
+  "total_dataset_questions": 15,
+  "total_questions": 15,
+  "eval_limit": null,
+  "completed_questions": 15,
+  "metrics": {
+    "citation_coverage": 0.9333,
+    "source_match_accuracy": 0.9333,
+    "answer_present_rate": 1.0,
+    "failure_rate": 0.0,
+    "average_latency_seconds": 4.376,
+    "average_answer_length_words": 16.67
+  },
+  "counts": {
+    "with_citations": 14,
+    "source_matches": 14,
+    "answers_present": 15,
+    "failures": 0
+  },
+  "error": null
+}

@@ -8,7 +8,7 @@ FETCH_K = 50
 MMR_LAMBDA = 0.7
 TOP_N = 10
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = "llama-3.1-8b-instant"
 LLM_PROVIDER = "groq"
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 VECTOR_DB_DIR = os.path.abspath(os.path.join(BASE_DIR, "vector_store", "db"))

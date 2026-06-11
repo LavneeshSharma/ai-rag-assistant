@@ -9,6 +9,7 @@ langchain-chroma
 langchain-groq
 langchain-huggingface
 langchain-text-splitters
+langsmith
 chromadb
 pypdf
 

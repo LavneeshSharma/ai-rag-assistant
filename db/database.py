@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 
@@ -11,7 +11,7 @@ LOCAL_USER_ID = "local"
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _connect() -> sqlite3.Connection:

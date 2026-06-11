@@ -1,16 +1,40 @@
 
+import time
+import re
+
 from utils.llm import create_llm
 from config.settings import MODEL_NAME
+from utils.tracing import (
+    extract_usage_and_cost,
+    record_trace_step,
+    truncate_prompt,
+)
 
 
 def rewrite_query(chat_history, question):
-    vague_words = ["it", "this", "that", "more", "elaborate", "detail"]
+    vague_words = [
+        "it", "this", "that", "these", "those", "more", "elaborate",
+        "detail", "mentioned", "above", "same", "first", "second",
+    ]
 
     question_lower = question.lower()
+    word_count = len(question.split())
 
-    has_vague_word = any(word in question_lower for word in vague_words)
+    has_vague_word = any(
+        re.search(rf"\b{re.escape(word)}\b", question_lower)
+        for word in vague_words
+    )
+    likely_needs_rewrite = has_vague_word or word_count <= 6
 
-    if not has_vague_word:
+    if not likely_needs_rewrite:
+        record_trace_step(
+            "query_rewrite",
+            inputs={"query": question},
+            outputs={
+                "rewritten_query": question,
+                "rewrite_needed": False,
+            },
+        )
         return question
     llm = create_llm()
 
@@ -40,9 +64,31 @@ User Question:
 Standalone Retrieval Query:
 """
 
+    started_at = time.perf_counter()
     response = llm.invoke(prompt)
+    rewritten_query = response.content.strip()
+    usage_and_cost = extract_usage_and_cost(
+        response=response,
+        prompt=prompt,
+        response_text=rewritten_query,
+    )
+    record_trace_step(
+        "query_rewrite",
+        inputs={
+            "query": question,
+            "chat_history": chat_history,
+            "prompt": truncate_prompt(prompt),
+        },
+        outputs={
+            "rewritten_query": rewritten_query,
+            "rewrite_needed": True,
+            **usage_and_cost,
+        },
+        run_type="llm",
+        latency_seconds=time.perf_counter() - started_at,
+    )
 
-    return response.content.strip()
+    return rewritten_query
 
 if __name__ == "__main__":
     history = """

@@ -3,5 +3,10 @@ venv/
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store
-vector_store/
+vector_store/db/
+vector_store/indexes/
+vector_store/eval_index/
+vector_store/parent_child_db/
+vector_store/active_index.json
+vector_store/parent_store.pkl
 *.pyc

@@ -14,7 +14,10 @@ try:
 except ImportError:
     OAuth2Session = None
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 from chains.conversational_rag import create_conversational_rag_chain
 from vector_store.chroma_store import (
     create_vector_store,
@@ -35,7 +38,6 @@ from db.database import (
     update_chat_title,
 )
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 from config.settings import DATA_DIR as REL_DATA_DIR
 
 # Ensure backend code that uses relative paths (config.settings) resolves correctly.

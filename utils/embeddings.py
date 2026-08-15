@@ -2,16 +2,17 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 from config.settings import EMBEDDING_MODEL
 
+_embedding_model = None
+
+
 def create_embeddings():
     """
-    Create embedding model.
+    Create (or reuse) the embedding model.
     """
-
-    embedding_model = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL
-    )
-
-    return embedding_model
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    return _embedding_model
 
 
 if __name__ == "__main__":

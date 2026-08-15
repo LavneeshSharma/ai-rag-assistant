@@ -205,36 +205,33 @@ def format_chat_history(chat_messages=None):
 
     return history_text
 
-def create_conversational_rag_chain(
+def _format_final_answer(response_text, sources):
+    if is_fallback_response(response_text):
+        return f"""
+Answer:
+{response_text}
+"""
+    return f"""
+Answer:
+{response_text}
+
+Sources: {sources}
+"""
+
+
+def _prepare_answer_context(
     question,
     active_index_path=None,
     chat_messages=None,
     file_names=None,
 ):
-    trace_metadata = {
-        "active_index_path": active_index_path,
-        "has_chat_messages": chat_messages is not None,
-        "file_names": file_names,
-    }
-    with RAGTrace(
-        "conversational_rag",
-        inputs={"query": question},
-        metadata=trace_metadata,
-    ):
-        return _create_conversational_rag_chain(
-            question,
-            active_index_path,
-            chat_messages,
-            file_names,
-        )
+    """Shared pre-LLM pipeline: rewrite -> retrieve -> weakness check -> prompt.
 
-
-def _create_conversational_rag_chain(
-    question,
-    active_index_path=None,
-    chat_messages=None,
-    file_names=None,
-):
+    Used by both the synchronous and streaming chain entry points so the
+    retrieval/tracing logic only lives in one place. Returns a dict with
+    either `fallback_answer` set (short-circuit: missing index / weak
+    retrieval) or `final_prompt`/`sources` set (ready for the LLM call).
+    """
     started_at = time.perf_counter()
     record_trace_step(
         "query",
@@ -259,7 +256,7 @@ No active index found. Upload and index PDFs first.
             },
             latency_seconds=time.perf_counter() - started_at,
         )
-        return answer
+        return {"fallback_answer": answer, "started_at": started_at}
 
     history = format_chat_history(chat_messages)
 
@@ -337,7 +334,7 @@ Answer:
             },
             latency_seconds=time.perf_counter() - started_at,
         )
-        return final_answer
+        return {"fallback_answer": final_answer, "started_at": started_at}
 
     prompt = load_prompt()
 
@@ -359,6 +356,52 @@ Answer:
         },
         run_type="prompt",
     )
+
+    return {
+        "fallback_answer": None,
+        "final_prompt": final_prompt,
+        "sources": sources,
+        "started_at": started_at,
+    }
+
+
+def create_conversational_rag_chain(
+    question,
+    active_index_path=None,
+    chat_messages=None,
+    file_names=None,
+):
+    trace_metadata = {
+        "active_index_path": active_index_path,
+        "has_chat_messages": chat_messages is not None,
+        "file_names": file_names,
+    }
+    with RAGTrace(
+        "conversational_rag",
+        inputs={"query": question},
+        metadata=trace_metadata,
+    ):
+        return _create_conversational_rag_chain(
+            question,
+            active_index_path,
+            chat_messages,
+            file_names,
+        )
+
+
+def _create_conversational_rag_chain(
+    question,
+    active_index_path=None,
+    chat_messages=None,
+    file_names=None,
+):
+    ctx = _prepare_answer_context(question, active_index_path, chat_messages, file_names)
+    if ctx["fallback_answer"] is not None:
+        return ctx["fallback_answer"]
+
+    started_at = ctx["started_at"]
+    final_prompt = ctx["final_prompt"]
+    sources = ctx["sources"]
 
     llm = create_llm()
 
@@ -382,18 +425,7 @@ Answer:
         latency_seconds=time.perf_counter() - llm_started_at,
     )
 
-    if is_fallback_response(response_text):
-        final_answer = f"""
-Answer:
-{response_text}
-"""
-    else:
-        final_answer = f"""
-Answer:
-{response_text}
-
-Sources: {sources}
-"""
+    final_answer = _format_final_answer(response_text, sources)
 
     if chat_messages is None:
         chat_history.append({
@@ -413,6 +445,90 @@ Sources: {sources}
     )
 
     return final_answer
+
+
+def stream_conversational_rag_chain(
+    question,
+    active_index_path=None,
+    chat_messages=None,
+    file_names=None,
+):
+    """Generator yielding answer text as it streams from the LLM.
+
+    Mirrors `_create_conversational_rag_chain` (same retrieval, tracing, and
+    final-string shape via `_format_final_answer`) but yields tokens as they
+    arrive instead of returning one string. This is the UI's entry point for
+    live streaming; `create_conversational_rag_chain` above keeps its plain
+    string return so `evaluation/run_eval.py` and `evaluation/evaluate.py`
+    are unaffected.
+    """
+    trace_metadata = {
+        "active_index_path": active_index_path,
+        "has_chat_messages": chat_messages is not None,
+        "file_names": file_names,
+    }
+    with RAGTrace(
+        "conversational_rag_stream",
+        inputs={"query": question},
+        metadata=trace_metadata,
+    ):
+        ctx = _prepare_answer_context(question, active_index_path, chat_messages, file_names)
+        if ctx["fallback_answer"] is not None:
+            yield ctx["fallback_answer"]
+            return
+
+        started_at = ctx["started_at"]
+        final_prompt = ctx["final_prompt"]
+        sources = ctx["sources"]
+
+        llm = create_llm()
+        llm_started_at = time.perf_counter()
+
+        response_text = ""
+        final_chunk = None
+        yield "\nAnswer:\n"
+        for chunk in llm.stream(final_prompt):
+            piece = chunk.content or ""
+            if piece:
+                response_text += piece
+                yield piece
+            final_chunk = chunk if final_chunk is None else final_chunk + chunk
+
+        usage_and_cost = extract_usage_and_cost(
+            response=final_chunk,
+            prompt=final_prompt,
+            response_text=response_text,
+        )
+        record_trace_step(
+            "llm_response",
+            inputs={"prompt": truncate_prompt(final_prompt)},
+            outputs={
+                "response": response_text,
+                "latency_seconds": round(time.perf_counter() - llm_started_at, 3),
+                **usage_and_cost,
+            },
+            run_type="llm",
+            latency_seconds=time.perf_counter() - llm_started_at,
+        )
+
+        yield "\n" if is_fallback_response(response_text) else f"\n\nSources: {sources}\n"
+
+        if chat_messages is None:
+            chat_history.append({
+                "question": question,
+                "answer": response_text
+            })
+            update_conversation_summary()
+
+        record_trace_step(
+            "final_answer",
+            inputs={"query": question},
+            outputs={
+                "answer": _format_final_answer(response_text, sources).strip(),
+                "sources": sources,
+            },
+            latency_seconds=time.perf_counter() - started_at,
+        )
 
 
 if __name__ == "__main__":

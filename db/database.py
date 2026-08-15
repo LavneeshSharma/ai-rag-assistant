@@ -2,7 +2,7 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -219,6 +219,18 @@ def get_messages(
     return [dict(row) for row in rows]
 
 
+def delete_message(message_id: str, user_id: str = LOCAL_USER_ID) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM messages
+            WHERE id = ?
+            AND chat_id IN (SELECT id FROM chats WHERE user_id = ?)
+            """,
+            (message_id, user_id),
+        )
+
+
 def update_chat_title(
     chat_id: str,
     title: str,
@@ -245,6 +257,15 @@ def update_chat_active_index_path(
             """,
             (active_index_path, _now(), chat_id, user_id),
         )
+
+
+def get_all_active_index_paths() -> List[str]:
+    """Every chat's active_index_path across all users, for safe index cleanup."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT active_index_path FROM chats WHERE active_index_path IS NOT NULL"
+        ).fetchall()
+    return [row["active_index_path"] for row in rows]
 
 
 def delete_chat(chat_id: str, user_id: str = LOCAL_USER_ID) -> None:
@@ -325,13 +346,51 @@ def remove_document(document_id: str, user_id: str = LOCAL_USER_ID) -> None:
         )
 
 
-def remove_documents_for_chat(chat_id: str, user_id: str = LOCAL_USER_ID) -> None:
+def get_usage_counts(user_id: str = LOCAL_USER_ID) -> Dict[str, int]:
+    """Chat/message/document totals for the Stats page's KPI cards."""
     with _connect() as conn:
-        conn.execute(
+        chat_count = conn.execute(
+            "SELECT COUNT(*) FROM chats WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+        message_count = conn.execute(
             """
-            DELETE FROM documents
-            WHERE chat_id = ?
-            AND chat_id IN (SELECT id FROM chats WHERE user_id = ?)
+            SELECT COUNT(*) FROM messages
+            JOIN chats ON chats.id = messages.chat_id
+            WHERE chats.user_id = ?
             """,
-            (chat_id, user_id),
-        )
+            (user_id,),
+        ).fetchone()[0]
+        document_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM documents
+            JOIN chats ON chats.id = documents.chat_id
+            WHERE chats.user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()[0]
+    return {
+        "chat_count": chat_count,
+        "message_count": message_count,
+        "document_count": document_count,
+    }
+
+
+def get_message_activity(
+    user_id: str = LOCAL_USER_ID,
+    days: int = 30,
+) -> List[Dict[str, Any]]:
+    """Messages per day for the last `days` days, oldest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT date(messages.created_at) AS day, COUNT(*) AS count
+            FROM messages
+            JOIN chats ON chats.id = messages.chat_id
+            WHERE chats.user_id = ?
+              AND date(messages.created_at) >= date('now', ?)
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            (user_id, f"-{days} days"),
+        ).fetchall()
+    return [{"date": row["day"], "count": row["count"]} for row in rows]

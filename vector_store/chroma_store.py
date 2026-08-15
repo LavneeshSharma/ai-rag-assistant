@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import shutil
 import stat
 import time
 import uuid
@@ -52,6 +53,29 @@ def reset_vector_store():
     gc.collect()
     time.sleep(0.3)
     _save_active_index_path(None)
+
+
+def cleanup_orphaned_indexes(keep_paths):
+    """Delete index folders under VECTOR_INDEXES_DIR not referenced in keep_paths.
+
+    Callers must pass every index path still in use (e.g. every chat's active
+    index across all users) so we never delete one that's still referenced.
+    """
+    if not os.path.isdir(VECTOR_INDEXES_DIR):
+        return []
+
+    keep_abs = {os.path.abspath(path) for path in keep_paths if path}
+    removed = []
+    for name in os.listdir(VECTOR_INDEXES_DIR):
+        folder_path = os.path.join(VECTOR_INDEXES_DIR, name)
+        if not os.path.isdir(folder_path) or os.path.abspath(folder_path) in keep_abs:
+            continue
+        try:
+            shutil.rmtree(folder_path)
+            removed.append(folder_path)
+        except OSError:
+            pass
+    return removed
 
 
 def create_vector_store(reset_existing=False, pdf_paths=None):

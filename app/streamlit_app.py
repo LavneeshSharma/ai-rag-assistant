@@ -1,13 +1,24 @@
+try:
+    __import__("pysqlite3")
+    import sys as _sys
+    _sys.modules["sqlite3"] = _sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
+
 import os
 import sys
 import gc
 import hashlib
 import html
+import json
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 try:
     from authlib.integrations.requests_client import OAuth2Session
@@ -18,8 +29,9 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from chains.conversational_rag import create_conversational_rag_chain
+from chains.conversational_rag import stream_conversational_rag_chain
 from vector_store.chroma_store import (
+    cleanup_orphaned_indexes,
     create_vector_store,
     get_active_index_path,
     reset_vector_store,
@@ -27,9 +39,14 @@ from vector_store.chroma_store import (
 from db.database import (
     add_document,
     create_chat as db_create_chat,
+    delete_chat as db_delete_chat,
+    delete_message,
+    get_all_active_index_paths,
     get_chats,
     get_documents,
     get_messages,
+    get_message_activity,
+    get_usage_counts,
     init_db,
     remove_document,
     save_message,
@@ -37,6 +54,7 @@ from db.database import (
     update_chat_active_index_path,
     update_chat_title,
 )
+from utils.stats import aggregate_usage_stats, read_eval_summary, read_trace_events, trace_file_fingerprint
 
 from config.settings import DATA_DIR as REL_DATA_DIR
 
@@ -232,6 +250,27 @@ def _chat_title_from_question(question: str) -> str:
     )
 
 
+def _date_bucket(iso_timestamp: str) -> str:
+    """Bucket a chat's timestamp into a ChatGPT-style sidebar group label."""
+    try:
+        dt = datetime.fromisoformat(iso_timestamp)
+    except (ValueError, TypeError):
+        return "Older"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    delta_days = (datetime.now(timezone.utc).date() - dt.astimezone(timezone.utc).date()).days
+    if delta_days <= 0:
+        return "Today"
+    if delta_days == 1:
+        return "Yesterday"
+    if delta_days <= 7:
+        return "Previous 7 Days"
+    if delta_days <= 30:
+        return "Previous 30 Days"
+    return "Older"
+
+
 def _persist_current_chat() -> None:
     chat_id = st.session_state.current_chat_id
     if not chat_id or chat_id not in st.session_state.chats:
@@ -248,42 +287,6 @@ def _persist_current_chat() -> None:
         update_chat_title(chat_id, title, _current_user_id())
 
 
-def _messages_to_history_pairs(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    pairs = []
-    pending_question = None
-
-    for message in messages:
-        if message.get("role") == "user":
-            pending_question = message.get("content", "")
-        elif message.get("role") == "assistant" and pending_question is not None:
-            pairs.append({
-                "question": pending_question,
-                "answer": message.get("content", ""),
-            })
-            pending_question = None
-
-    return pairs
-
-
-def _ask_current_chat(
-    question: str,
-    active_index_path: Optional[str],
-    previous_messages: List[Dict[str, str]],
-) -> str:
-    if "chat_messages" in create_conversational_rag_chain.__code__.co_varnames:
-        return create_conversational_rag_chain(
-            question,
-            active_index_path,
-            chat_messages=previous_messages,
-        )
-
-    create_conversational_rag_chain.__globals__["chat_history"] = (
-        _messages_to_history_pairs(previous_messages)
-    )
-    create_conversational_rag_chain.__globals__["conversation_summary"] = ""
-    return create_conversational_rag_chain(question, active_index_path)
-
-
 def init_session_state() -> None:
     init_db()
     defaults = {
@@ -298,13 +301,17 @@ def init_session_state() -> None:
         "oauth_state": None,
         "selected_pdf_ids": [],
         "uploader_key": 0,
-        "chat_text_key": 0,
         "is_indexing": False,
         "needs_reindex": False,
         "oauth_notice": None,
         "chat_search": "",
         "show_auth_dialog": False,
         "pending_user_question": None,
+        "active_view": "chat",
+        "confirm_delete_chat_id": None,
+        "regenerate_question": None,
+        "is_responding": False,
+        "sidebar_collapsed": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -393,9 +400,11 @@ def create_new_chat() -> None:
     st.session_state.messages = []
     st.session_state.uploaded_pdf_docs = []
     st.session_state.uploaded_pdfs = []
+    st.session_state.active_view = "chat"
 
 
 def switch_chat(chat_id: str) -> None:
+    st.session_state.active_view = "chat"
     if chat_id == st.session_state.current_chat_id:
         return
     if chat_id not in st.session_state.chats:
@@ -405,6 +414,24 @@ def switch_chat(chat_id: str) -> None:
     st.session_state.messages = get_messages(chat_id, _current_user_id())
     st.session_state.chats[chat_id]["messages"] = list(st.session_state.messages)
     _sync_pdfs_for_current_chat()
+
+
+def delete_chat_and_switch(chat_id: str) -> None:
+    db_delete_chat(chat_id, _current_user_id())
+    st.session_state.chats.pop(chat_id, None)
+
+    if st.session_state.current_chat_id != chat_id:
+        return
+
+    remaining = sorted(
+        st.session_state.chats.values(),
+        key=lambda c: c.get("updated_at", ""),
+        reverse=True,
+    )
+    if remaining:
+        switch_chat(remaining[0]["id"])
+    else:
+        create_new_chat()
 
 
 def clear_current_chat() -> None:
@@ -509,6 +536,10 @@ def safe_reindex() -> bool:
             st.session_state.chats[st.session_state.current_chat_id][
                 "active_index_path"
             ] = active_index_path
+            keep_paths = set(get_all_active_index_paths())
+            if active_index_path:
+                keep_paths.add(active_index_path)
+            cleanup_orphaned_indexes(keep_paths)
         st.session_state.needs_reindex = False
         return True
     finally:
@@ -545,136 +576,206 @@ def clear_all_pdfs() -> None:
 
 # ── CSS ─────────────────────────────────────────────────────────────
 
-CUSTOM_CSS = """
+def build_custom_css(sidebar_collapsed: bool) -> str:
+    sidebar_width = "0px" if sidebar_collapsed else "260px"
+    return f"""
 <style>
-    :root {
-        --sidebar-width: 260px;
-        --bg-main: #1f1f1f;
-        --bg-sidebar: #171717;
-        --bg-input: #2b2b2b;
-        --bg-hover: #242424;
-        --border-color: #333333;
+    :root {{
+        --sidebar-width: {sidebar_width};
+        --bg-main: #212121;
+        --bg-sidebar: #181818;
+        --bg-input: #2f2f2f;
+        --bg-hover: #2a2a2a;
+        --bg-elevated: #303030;
+        --border-color: #3a3a3a;
         --text-primary: #ececec;
         --text-secondary: #b4b4b4;
-        --text-muted: #8b8b8b;
+        --text-muted: #8e8ea0;
+        --accent: #10a37f;
         --danger: #ef4444;
-    }
+        --radius-sm: 8px;
+        --radius-md: 12px;
+        --radius-lg: 16px;
+        --radius-pill: 999px;
+    }}
 
-    .stApp { background: var(--bg-main); }
-    [data-testid="collapsedControl"] { display: none !important; }
+    * {{ scrollbar-color: #4a4a4a transparent; }}
+    ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+    ::-webkit-scrollbar-thumb {{ background: #4a4a4a; border-radius: 4px; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: #5a5a5a; }}
+    ::-webkit-scrollbar-track {{ background: transparent; }}
 
-    section[data-testid="stSidebar"] {
+    .stApp {{ background: var(--bg-main); }}
+    [data-testid="collapsedControl"] {{ display: none !important; }}
+    [data-testid="stSidebarCollapseButton"] {{ display: none !important; }}
+    [data-testid="stExpandSidebarButton"] {{ display: none !important; }}
+    header[data-testid="stHeader"] {{ background: transparent !important; height: 2.2rem !important; }}
+
+    /* ── Sidebar shell ─────────────────────────────────────────── */
+    section[data-testid="stSidebar"] {{
         background: var(--bg-sidebar) !important;
-        min-width: 260px !important;
-        max-width: 260px !important;
+        width: var(--sidebar-width) !important;
+        min-width: var(--sidebar-width) !important;
+        max-width: var(--sidebar-width) !important;
         border-right: none !important;
-    }
-    section[data-testid="stSidebar"] > div { padding: 0 !important; }
-    section[data-testid="stSidebar"] .block-container {
-        padding: 12px 8px 84px !important;
+        overflow: hidden !important;
+        transform: none !important;
+        transition: min-width 0.18s ease, max-width 0.18s ease, width 0.18s ease;
+    }}
+    @media (max-width: 768px) {{
+        section[data-testid="stSidebar"] {{
+            position: fixed !important;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            z-index: 999 !important;
+            box-shadow: {"none" if sidebar_collapsed else "2px 0 24px rgba(0,0,0,0.5)"};
+        }}
+    }}
+    section[data-testid="stSidebar"] > div {{ padding: 0 !important; }}
+    section[data-testid="stSidebar"] .block-container {{
+        padding: 8px 8px 10px !important;
         display: flex;
         flex-direction: column;
         min-height: 100vh;
-    }
-    section[data-testid="stSidebar"] .element-container {
-        margin-bottom: 2px !important;
-    }
-    section[data-testid="stSidebar"] .stMarkdown {
-        margin-bottom: 0 !important;
-    }
+        width: 260px;
+    }}
+    section[data-testid="stSidebar"] .element-container {{ margin-bottom: 2px !important; }}
+    section[data-testid="stSidebar"] .stMarkdown {{ margin-bottom: 0 !important; }}
 
-    section[data-testid="stSidebar"] .stButton > button {
+    /* `.stButton button` (descendant), not `.stButton > button` (direct child):
+       a button with help= gets wrapped in extra tooltip divs by Streamlit,
+       breaking direct-child selectors throughout this stylesheet. */
+    section[data-testid="stSidebar"] .stButton button {{
         width: 100%;
         text-align: left;
         background: transparent !important;
         border: none !important;
         color: #e8e8e8 !important;
-        padding: 7px 10px !important;
-        border-radius: 8px !important;
-        font-size: 15px !important;
+        padding: 8px 10px !important;
+        border-radius: var(--radius-sm) !important;
+        font-size: 14px !important;
         font-weight: 400 !important;
         box-shadow: none !important;
-        min-height: 34px !important;
-        line-height: 1.15 !important;
-    }
-    section[data-testid="stSidebar"] .stButton > button:hover {
+        min-height: 36px !important;
+        line-height: 1.2 !important;
+        transition: background 0.12s ease;
+    }}
+    section[data-testid="stSidebar"] .stButton button:hover {{
         background: var(--bg-hover) !important;
         color: #ffffff !important;
-    }
+    }}
 
-    .sb-header {
+    .st-key-sidebar_header_row {{ margin-bottom: 8px; }}
+    .st-key-sidebar_header_row [data-testid="stHorizontalBlock"] {{
+        align-items: center !important;
+        gap: 0 !important;
+    }}
+    .st-key-sidebar_header_row .stButton button {{
+        width: auto !important;
+        background: transparent !important;
+        border: none !important;
+        color: var(--text-secondary) !important;
+        font-size: 16px !important;
+        padding: 6px 10px !important;
+        min-height: 34px !important;
+        border-radius: var(--radius-sm) !important;
+        box-shadow: none !important;
+    }}
+    .st-key-sidebar_header_row .stButton button:hover {{
+        background: var(--bg-hover) !important;
+        color: #ffffff !important;
+    }}
+    .sb-header {{
         display: flex;
         align-items: center;
         gap: 8px;
-        padding: 4px 8px 12px;
-        font-size: 16px;
+        padding: 8px 10px;
+        font-size: 15px;
         font-weight: 600;
         color: #ffffff;
-    }
-    .sb-logo {
-        width: 20px;
-        height: 20px;
-        border-radius: 6px;
-        background: #2f2f2f;
-        color: #f4f4f5;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 12px;
-    }
-    .sb-section-title {
-        padding: 10px 10px 4px;
-        font-size: 13px;
-        font-weight: 500;
+    }}
+    .sb-logo {{
+        width: 24px; height: 24px; border-radius: 7px;
+        background: linear-gradient(135deg, #10a37f, #0d8a6c);
+        color: #fff;
+        display: inline-flex; align-items: center; justify-content: center;
+        font-size: 13px; font-weight: 700;
+        flex-shrink: 0;
+    }}
+    .sb-section-title {{
+        padding: 14px 10px 6px;
+        font-size: 11px;
+        font-weight: 600;
         color: var(--text-muted);
-        text-transform: none;
-        letter-spacing: 0;
-    }
-    .st-key-recents_list .element-container {
-        margin-bottom: 0 !important;
-    }
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }}
+    .sb-date-group {{
+        padding: 12px 10px 4px;
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }}
+    .st-key-sidebar_search {{ padding: 2px 2px 8px; }}
+    .st-key-sidebar_search .stTextInput input {{
+        background: var(--bg-elevated) !important;
+        color: var(--text-primary) !important;
+        border: 1px solid transparent !important;
+        border-radius: var(--radius-pill) !important;
+        font-size: 13px !important;
+        padding: 8px 14px !important;
+    }}
+    .st-key-sidebar_search .stTextInput div[data-baseweb="input"],
+    .st-key-sidebar_search .stTextInput div[data-baseweb="base-input"] {{
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }}
+    .st-key-sidebar_search .stTextInput input::placeholder {{ color: var(--text-muted) !important; }}
+    .st-key-sidebar_search .stTextInput input:focus {{
+        outline: none !important;
+        box-shadow: 0 0 0 1px var(--accent) !important;
+    }}
+
+    .st-key-recents_list .element-container {{ margin-bottom: 0 !important; }}
     .st-key-recents_list[data-testid="stVerticalBlock"],
     .st-key-recents_list [data-testid="stVerticalBlock"],
-    .st-key-recents_list [data-testid="stVerticalBlockBorderWrapper"] {
-        gap: 1px !important;
-    }
-    .st-key-recents_list .stButton > button {
-        min-height: 36px !important;
-        height: 36px !important;
+    .st-key-recents_list [data-testid="stVerticalBlockBorderWrapper"] {{ gap: 1px !important; }}
+    .st-key-recents_list [data-testid="stHorizontalBlock"] {{
+        gap: 0.15rem !important;
+        align-items: center !important;
+    }}
+    .st-key-recents_list .stButton button {{
+        min-height: 34px !important;
+        height: 34px !important;
         padding: 7px 10px !important;
-        font-size: 14px !important;
-        line-height: 1.15 !important;
+        font-size: 13.5px !important;
+        line-height: 1.2 !important;
         overflow: hidden !important;
         text-overflow: ellipsis !important;
         white-space: nowrap !important;
         justify-content: flex-start !important;
-    }
-    .st-key-recents_list button {
-        font-size: 14px !important;
-    }
-    section[data-testid="stSidebar"] .st-key-recents_list [data-testid="stBaseButton-secondary"] {
-        font-size: 14px !important;
-    }
-    .st-key-recent_active_chat .stButton > button {
-        background: #242424 !important;
+        border-radius: var(--radius-sm) !important;
+    }}
+    .st-key-recent_active_chat .stButton button,
+    section[data-testid="stSidebar"] .st-key-recent_active_chat [data-testid="stBaseButton-secondary"] {{
+        background: var(--bg-elevated) !important;
         color: #ffffff !important;
-        border-radius: 8px !important;
-    }
-    section[data-testid="stSidebar"] .st-key-recent_active_chat [data-testid="stBaseButton-secondary"] {
-        background: #242424 !important;
-        color: #ffffff !important;
-        border-radius: 8px !important;
-    }
-    .st-key-profile_area {
-        position: fixed;
-        left: 8px;
-        bottom: 8px;
-        width: 244px;
+        border-radius: var(--radius-sm) !important;
+    }}
+
+    .st-key-profile_area {{
+        position: sticky;
+        bottom: 0;
         background: var(--bg-sidebar);
-        padding-top: 6px;
-        z-index: 20;
-    }
-    .st-key-profile_area .stButton > button {
+        padding: 8px 0 2px;
+        margin-top: auto;
+        border-top: 1px solid var(--border-color);
+    }}
+    .st-key-profile_area .stButton button {{
         display: flex !important;
         align-items: center !important;
         justify-content: flex-start !important;
@@ -682,131 +783,122 @@ CUSTOM_CSS = """
         min-height: 42px !important;
         padding: 8px 10px !important;
         font-size: 14px !important;
-    }
-    .sb-user-name { font-size: 14px; font-weight: 500; color: #f2f2f2; line-height: 1.25; }
-    .sb-user-email { font-size: 12px; color: #a6a6a6; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .sb-avatar {
+    }}
+    .sb-user-name {{ font-size: 14px; font-weight: 500; color: #f2f2f2; line-height: 1.25; }}
+    .sb-user-email {{ font-size: 12px; color: #a6a6a6; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .sb-avatar {{
         width: 28px; height: 28px; border-radius: 50%;
         background: #e8605f; color: #fff;
         display: flex; align-items: center; justify-content: center;
         font-size: 12px; font-weight: 600;
-    }
-    .sb-avatar-img {
+    }}
+    .sb-avatar-img {{
         width: 28px; height: 28px; border-radius: 50%;
         object-fit: cover; display: block;
-    }
+    }}
 
-    .main .block-container {
-        max-width: 760px;
-        margin: 0 auto;
-        padding: 46px 1rem 150px 1rem;
-    }
-
-    .empty-state { text-align: center; padding: 18vh 1rem 0; }
-    .empty-title { font-size: 26px; font-weight: 600; color: var(--text-primary); margin-bottom: 8px; }
-    .empty-sub { font-size: 14px; color: var(--text-secondary); }
-
-    .stChatMessage { padding: 8px 0 !important; }
-    [data-testid="stChatMessageContent"] {
+    /* ── Top app header (main content) ────────────────────────────── */
+    .st-key-app_header {{
+        position: sticky;
+        top: 0;
+        z-index: 40;
+        background: var(--bg-main);
+        padding: 10px 2px 12px;
+    }}
+    .st-key-app_header [data-testid="stHorizontalBlock"] {{
+        align-items: center !important;
+        gap: 4px !important;
+    }}
+    .st-key-app_header .stButton button {{
         background: transparent !important;
         border: none !important;
-        color: var(--text-primary) !important;
-        font-size: 15px !important;
-        line-height: 1.7 !important;
-    }
-    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
-        display: flex !important;
-        justify-content: flex-end !important;
-    }
-    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
-        display: flex !important;
-        justify-content: flex-start !important;
-    }
-    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"])
-    [data-testid="stChatMessageContent"] {
-        max-width: 78%;
-        margin-right: auto;
-    }
-    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
-    [data-testid="stChatMessageContent"] {
-        background: var(--bg-input) !important;
-        border-radius: 16px !important;
-        padding: 9px 13px !important;
-        max-width: 70%;
-        margin-left: auto !important;
-        margin-right: 0 !important;
-        line-height: 1.45 !important;
-    }
-    [data-testid="stChatMessageAvatarUser"],
-    [data-testid="stChatMessageAvatarAssistant"] {
-        display: none !important;
-    }
-    .assistant-answer {
-        color: var(--text-primary);
-        font-size: 15px;
-        line-height: 1.65;
-    }
-    .assistant-sources {
-        margin-top: 10px;
+        color: var(--text-secondary) !important;
+        font-size: 16px !important;
+        padding: 6px 10px !important;
+        min-height: 34px !important;
+        border-radius: var(--radius-sm) !important;
+        box-shadow: none !important;
+        transition: background 0.12s ease;
+    }}
+    .st-key-app_header .stButton button:hover {{
+        background: var(--bg-hover) !important;
+        color: #fff !important;
+    }}
+    .app-header-title {{
+        font-size: 14px;
+        font-weight: 600;
         color: var(--text-secondary);
-        font-size: 13px;
-        line-height: 1.45;
-    }
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }}
 
-    .st-key-input_panel {
-        position: fixed;
-        bottom: 0;
-        left: var(--sidebar-width);
-        right: 0;
-        background: var(--bg-main);
-        padding: 4px 16px 16px;
-        z-index: 100;
-        width: auto;
-        max-width: none;
-        display: flex !important;
-        flex-direction: column !important;
-        align-items: center !important;
-        margin: 0 !important;
-        box-sizing: border-box !important;
-    }
-    .st-key-pdf_chips_area {
-        margin-bottom: 4px;
-        width: min(760px, calc(100vw - var(--sidebar-width) - 32px)) !important;
-        max-width: min(760px, calc(100vw - var(--sidebar-width) - 32px)) !important;
-    }
-    .st-key-pdf_chips_area [class*="st-key-pdf_chip_"][data-testid="stVerticalBlock"] {
+    /* ── Main content ──────────────────────────────────────────── */
+    .main .block-container {{
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 1rem 140px 1rem;
+    }}
+
+    .empty-state {{ text-align: center; padding: 12vh 1rem 0; }}
+    .empty-title {{ font-size: 28px; font-weight: 600; color: var(--text-primary); margin-bottom: 8px; letter-spacing: -0.01em; }}
+    .empty-sub {{ font-size: 14px; color: var(--text-secondary); margin-bottom: 26px; }}
+
+    .st-key-starter_prompts {{ margin-bottom: 12px; }}
+    .st-key-starter_prompts [data-testid="stHorizontalBlock"] {{ gap: 10px !important; }}
+    .st-key-starter_prompts .stButton button {{
+        background: var(--bg-elevated) !important;
+        border: 1px solid var(--border-color) !important;
+        color: var(--text-primary) !important;
+        border-radius: var(--radius-md) !important;
+        padding: 12px 14px !important;
+        font-size: 13px !important;
+        text-align: left !important;
+        white-space: normal !important;
+        min-height: 64px !important;
+        box-shadow: none !important;
+        transition: background 0.12s ease, border-color 0.12s ease;
+    }}
+    .st-key-starter_prompts .stButton button:hover {{
+        background: var(--bg-hover) !important;
+        border-color: #4a4a4a !important;
+    }}
+
+    /* ── Active documents bar ─────────────────────────────────────── */
+    .st-key-active_docs_bar {{ margin: 0 0 14px; }}
+    .st-key-active_docs_bar [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap !important; gap: 6px !important; }}
+    .st-key-active_docs_bar [class*="st-key-pdf_chip_"][data-testid="stVerticalBlock"] {{
         position: relative !important;
-        width: min(100%, 320px) !important;
-        height: 28px !important;
-        min-height: 28px !important;
-        background: #292929 !important;
-        border-radius: 16px !important;
+        width: min(100%, 260px) !important;
+        height: 30px !important;
+        min-height: 30px !important;
+        background: var(--bg-elevated) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: var(--radius-pill) !important;
         overflow: hidden !important;
         padding: 0 !important;
         gap: 0 !important;
-    }
-    .st-key-pdf_chips_area [class*="st-key-pdf_chip_"] .element-container {
-        margin: 0 !important;
-    }
-    .pdf-chip-label {
+    }}
+    .st-key-active_docs_bar [class*="st-key-pdf_chip_"] .element-container {{ margin: 0 !important; }}
+    .pdf-chip-label {{
         position: absolute;
-        inset: 3px 30px 3px 8px;
+        inset: 3px 30px 3px 10px;
         display: flex;
         align-items: center;
         gap: 6px;
         min-width: 0;
         color: var(--text-secondary);
-        font-size: 13px;
-        line-height: 22px;
+        font-size: 12.5px;
+        line-height: 24px;
         pointer-events: none;
-    }
-    .pdf-chip-name {
+    }}
+    .pdf-chip-name {{
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-    }
-    .st-key-pdf_chips_area [class*="st-key-remove_pdf_"] {
+    }}
+    .st-key-active_docs_bar [class*="st-key-remove_pdf_"] {{
         position: absolute !important;
         top: 3px !important;
         right: 4px !important;
@@ -814,54 +906,22 @@ CUSTOM_CSS = """
         height: 22px !important;
         margin: 0 !important;
         z-index: 2 !important;
-    }
-    .st-key-pdf_chips_area [class*="st-key-remove_pdf_"] .stButton {
+    }}
+    .st-key-active_docs_bar [class*="st-key-remove_pdf_"] .stButton {{
         position: static !important;
         width: 22px !important;
         height: 22px !important;
         margin: 0 !important;
-    }
-    .st-key-pdf_chips_area [data-testid="stHorizontalBlock"] {
-        width: min(100%, 320px) !important;
-        max-width: min(100%, 320px);
-        background: #292929;
-        border: none;
-        border-radius: 16px;
-        padding: 1px 4px 1px 8px;
-        align-items: center !important;
-        gap: 0 !important;
-        flex-wrap: nowrap !important;
-        overflow: hidden !important;
-        min-height: 28px !important;
-    }
-    .st-key-pdf_chips_area [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+    }}
+    .st-key-active_docs_bar [data-testid="stHorizontalBlock"] [data-testid="column"] {{
         min-width: 0 !important;
         flex-grow: 0 !important;
-    }
-    .st-key-pdf_chips_area [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(1) {
-        flex: 0 0 22px !important;
-        width: 22px !important;
-    }
-    .st-key-pdf_chips_area [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(2) {
-        flex: 1 1 auto !important;
-        width: calc(100% - 54px) !important;
-        max-width: calc(100% - 54px) !important;
-        overflow: hidden !important;
-    }
-    .st-key-pdf_chips_area [data-testid="stHorizontalBlock"] > [data-testid="column"]:nth-child(3) {
-        flex: 0 0 28px !important;
-        width: 28px !important;
-    }
-    .st-key-pdf_chips_area [data-testid="stCaptionContainer"],
-    .st-key-pdf_chips_area [data-testid="stCaptionContainer"] p {
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        max-width: 100% !important;
-        line-height: 22px !important;
-        margin: 0 !important;
-    }
-    .st-key-pdf_chips_area .stButton > button {
+        width: auto !important;
+    }}
+    .st-key-active_docs_bar [class*="st-key-pdf_chip_"] [data-testid="stCaptionContainer"] {{
+        display: none;
+    }}
+    .st-key-active_docs_bar .stButton button {{
         min-height: 22px !important;
         height: 22px !important;
         width: 22px !important;
@@ -872,167 +932,190 @@ CUSTOM_CSS = """
         border: none !important;
         color: var(--text-muted) !important;
         border-radius: 50% !important;
-    }
-    .st-key-pdf_chips_area [data-testid="stBaseButton-secondary"] {
-        min-height: 22px !important;
-        height: 22px !important;
-        width: 22px !important;
-        padding: 0 !important;
-        font-size: 13px !important;
-        line-height: 1 !important;
-        background: transparent !important;
-        border: none !important;
         box-shadow: none !important;
-        color: var(--text-muted) !important;
-        border-radius: 50% !important;
-    }
-    .st-key-pdf_chips_area .stButton > button:hover {
+    }}
+    .st-key-active_docs_bar .stButton button:hover {{
         background: rgba(255,255,255,0.10) !important;
         color: var(--danger) !important;
-    }
-    .st-key-input_bar {
-        width: min(760px, calc(100vw - var(--sidebar-width) - 32px)) !important;
-        max-width: min(760px, calc(100vw - var(--sidebar-width) - 32px)) !important;
-        background: var(--bg-input);
-        border-radius: 24px;
-        padding: 5px 8px;
-        box-shadow: none !important;
-        box-sizing: border-box !important;
-    }
-    .st-key-input_bar [data-testid="stHorizontalBlock"] {
-        display: flex !important;
-        flex-direction: row !important;
-        flex-wrap: nowrap !important;
-        align-items: center !important;
-        gap: 0.25rem !important;
-        width: 100% !important;
-        min-height: 42px !important;
-        background: transparent !important;
-    }
-    .st-key-input_bar [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
-        min-width: 0 !important;
-        flex: 0 0 auto !important;
-        width: auto !important;
-    }
-    .st-key-input_bar [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(1),
-    .st-key-input_bar [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(3) {
-        flex: 0 0 34px !important;
-        width: 34px !important;
-        max-width: 34px !important;
-    }
-    .st-key-input_bar [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2) {
-        flex: 1 1 auto !important;
-        width: auto !important;
-        max-width: none !important;
-        min-width: 0 !important;
-    }
-    .st-key-input_bar .element-container,
-    .st-key-input_bar .stTextInput,
-    .st-key-input_bar .stButton,
-    .st-key-input_bar [data-testid="stFileUploader"] {
-        margin: 0 !important;
-        width: 100% !important;
-    }
-    .st-key-input_bar [data-testid="stFileUploader"] section {
-        padding: 0 !important;
-    }
-    .st-key-input_bar [data-testid="stFileUploader"] label,
-    .st-key-input_bar [data-testid="stFileUploaderDropzoneInstructions"],
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] svg,
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] small,
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] p {
-        display: none !important;
-    }
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] {
-        width: 32px !important;
-        height: 32px !important;
-        min-height: 32px !important;
-        padding: 0 !important;
-        background: transparent !important;
-        border: none !important;
-        border-radius: 50% !important;
-    }
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] button,
-    .st-key-input_bar .stButton > button {
-        width: 32px !important;
-        height: 32px !important;
-        min-height: 32px !important;
-        padding: 0 !important;
-        border: none !important;
-        border-radius: 50% !important;
-        background: transparent !important;
-        box-shadow: none !important;
-        color: var(--text-secondary) !important;
-    }
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] button {
-        color: transparent !important;
-        font-size: 0 !important;
-    }
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] button::before {
-        content: "+";
-        color: var(--text-secondary);
-        font-size: 22px;
-        line-height: 1;
-        font-weight: 300;
-    }
-    .st-key-input_bar [data-testid="stFileUploaderDropzone"] button:hover,
-    .st-key-input_bar .stButton > button:hover {
-        background: var(--bg-hover) !important;
-    }
+    }}
 
-    .st-key-input_bar .stTextInput input {
+    /* ── Chat messages ─────────────────────────────────────────── */
+    .stChatMessage {{ padding: 10px 0 !important; }}
+    [data-testid="stChatMessageContent"] {{
         background: transparent !important;
+        border: none !important;
         color: var(--text-primary) !important;
-        border: none !important;
-        padding: 8px 4px !important;
         font-size: 15px !important;
-    }
-    .st-key-input_bar .stTextInput div[data-baseweb="input"],
-    .st-key-input_bar .stTextInput div[data-baseweb="base-input"],
-    .st-key-input_bar .stTextInput div[data-baseweb="input"] > div,
-    .st-key-input_bar .stTextInput div[data-baseweb="input"]:focus-within {
+        line-height: 1.7 !important;
+    }}
+    [data-testid="stChatMessageContent"] p {{ margin-bottom: 0.6em !important; }}
+    [data-testid="stChatMessageContent"] code {{
+        background: var(--bg-elevated);
+        padding: 2px 5px;
+        border-radius: 4px;
+        font-size: 13px;
+    }}
+    [data-testid="stChatMessageContent"] pre {{
+        background: var(--bg-elevated) !important;
+        border-radius: var(--radius-sm) !important;
+        border: 1px solid var(--border-color) !important;
+    }}
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {{
+        display: flex !important;
+        justify-content: flex-end !important;
+    }}
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {{
+        display: flex !important;
+        justify-content: flex-start !important;
+    }}
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"])
+    [data-testid="stChatMessageContent"] {{
+        max-width: 100%;
+        margin-right: auto;
+    }}
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"])
+    [data-testid="stChatMessageContent"] {{
+        background: var(--bg-input) !important;
+        border-radius: var(--radius-lg) !important;
+        padding: 10px 15px !important;
+        max-width: 70%;
+        margin-left: auto !important;
+        margin-right: 0 !important;
+        line-height: 1.5 !important;
+    }}
+    [data-testid="stChatMessageAvatarUser"],
+    [data-testid="stChatMessageAvatarAssistant"] {{
+        display: none !important;
+    }}
+    .assistant-sources {{
+        margin-top: 10px;
+        padding: 8px 12px;
+        background: var(--bg-elevated);
+        border-radius: var(--radius-sm);
+        color: var(--text-secondary);
+        font-size: 12.5px;
+        line-height: 1.5;
+    }}
+    .assistant-sources strong {{
+        color: var(--text-muted);
+        font-weight: 600;
+        text-transform: uppercase;
+        font-size: 11px;
+        letter-spacing: 0.03em;
+        display: block;
+        margin-bottom: 4px;
+    }}
+
+    [class*="st-key-msg_actions_"] {{
+        opacity: 0;
+        transition: opacity 0.12s ease;
+        margin-top: 2px;
+    }}
+    [data-testid="stChatMessage"]:hover [class*="st-key-msg_actions_"] {{ opacity: 1; }}
+    @media (hover: none) {{
+        [class*="st-key-msg_actions_"] {{ opacity: 1 !important; }}
+    }}
+    [class*="st-key-msg_actions_"] .stButton button {{
+        min-height: 28px !important;
+        height: 28px !important;
+        padding: 0 10px !important;
+        font-size: 12.5px !important;
+        white-space: nowrap !important;
         background: transparent !important;
         border: none !important;
+        color: var(--text-muted) !important;
+        border-radius: var(--radius-sm) !important;
         box-shadow: none !important;
-        outline: none !important;
-    }
-    .st-key-input_bar .stTextInput input:focus {
-        outline: none !important;
+        transition: background 0.12s ease, color 0.12s ease;
+    }}
+    [class*="st-key-msg_actions_"] .stButton button:hover {{
+        background: var(--bg-hover) !important;
+        color: var(--text-primary) !important;
+    }}
+    [class*="st-key-msg_actions_"] iframe {{ display: block; }}
+
+    /* ── Chat input (native st.chat_input) ────────────────────────── */
+    [data-testid="stChatInput"] {{
+        background: var(--bg-input) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: 26px !important;
+    }}
+    [data-testid="stChatInput"] textarea {{
+        color: var(--text-primary) !important;
+        /* Streamlit 1.50's chat_input auto-resize misfires on this page
+           (renders ~260px tall) unless height is explicitly constrained. */
+        height: auto !important;
+        max-height: 200px !important;
+    }}
+    [data-testid="stChatInput"] textarea::placeholder {{
+        color: var(--text-muted) !important;
+    }}
+    [data-testid="stChatInputSubmitButton"] button,
+    [data-testid="stChatInputSubmitButton"] {{
+        background: var(--text-primary) !important;
+        border-radius: 50% !important;
+    }}
+    [data-testid="stBottomBlockContainer"] {{
+        background: var(--bg-main) !important;
+    }}
+
+    /* ── Popovers / dialogs ────────────────────────────────────── */
+    [class*="st-key-chat_row_menu_"] [data-testid="stPopover"] > button,
+    [class*="st-key-chat_row_menu_"] button[data-testid="stPopoverButton"] {{
+        min-height: 34px !important;
+        height: 34px !important;
+        padding: 0 !important;
+        background: transparent !important;
+        border: none !important;
+        color: var(--text-muted) !important;
         box-shadow: none !important;
-    }
-    .st-key-input_bar .stTextInput input::placeholder { color: var(--text-muted) !important; }
+    }}
+    [class*="st-key-chat_row_menu_"] [data-testid="stPopover"] > button:hover {{
+        background: var(--bg-hover) !important;
+        color: #ffffff !important;
+    }}
+    div[data-testid="stPopoverBody"] {{
+        background: var(--bg-elevated) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: var(--radius-md) !important;
+        color: var(--text-primary) !important;
+    }}
+    div[data-testid="stPopoverBody"] .stTextInput input {{
+        background: var(--bg-hover) !important;
+        color: var(--text-primary) !important;
+        border: 1px solid var(--border-color) !important;
+    }}
+    div[data-testid="stDialog"] div[role="dialog"] {{
+        background: var(--bg-elevated) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: var(--radius-lg) !important;
+        color: var(--text-primary) !important;
+    }}
 
-    @media (max-width: 760px) {
-        .st-key-input_panel {
-            left: 0;
-            right: 0;
-            padding-left: 16px;
-            padding-right: 16px;
-        }
-        .st-key-pdf_chips_area,
-        .st-key-input_bar {
-            width: calc(100vw - 32px) !important;
-            max-width: calc(100vw - 32px) !important;
-        }
-    }
+    /* ── Stats page ────────────────────────────────────────────── */
+    .stats-title {{ font-size: 22px; font-weight: 600; color: var(--text-primary); }}
+    .stats-caption {{ color: var(--text-muted); font-size: 13px; margin: 2px 0 10px; }}
+    div[data-testid="stMetric"] {{
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-md);
+        padding: 14px 16px !important;
+    }}
+    div[data-testid="stMetricLabel"] {{ color: var(--text-muted) !important; }}
 
-    .oauth-notice { font-size: 12px; color: var(--text-muted); padding: 6px 8px 0; }
-    .auth-dialog-copy {
+    /* ── Misc ──────────────────────────────────────────────────── */
+    .oauth-notice {{ font-size: 12px; color: var(--text-muted); padding: 6px 8px 0; }}
+    .auth-dialog-copy {{
         color: var(--text-secondary);
         font-size: 14px;
         line-height: 1.45;
         margin-bottom: 12px;
-    }
-    .account-menu-user {
+    }}
+    .account-menu-user {{
         padding: 6px 4px 8px;
-        border-bottom: 1px solid #303030;
+        border-bottom: 1px solid var(--border-color);
         margin-bottom: 6px;
-    }
-    div[data-testid="stDialog"] div[role="dialog"] {
-        background: #202020 !important;
-        border: 1px solid #303030 !important;
-        color: var(--text-primary) !important;
-    }
+    }}
 </style>
 """
 
@@ -1089,22 +1172,93 @@ def render_sign_in_dialog() -> None:
     sign_in_dialog()
 
 
-def render_sidebar() -> None:
-    with st.sidebar:
+def render_delete_chat_dialog() -> None:
+    chat_id = st.session_state.confirm_delete_chat_id
+    chat = st.session_state.chats.get(chat_id)
+    if not chat:
+        st.session_state.confirm_delete_chat_id = None
+        return
+
+    @st.dialog("Delete chat", width="small")
+    def confirm_delete() -> None:
+        title = chat.get("title") or "this chat"
         st.markdown(
-            '<div class="sb-header"><span class="sb-logo">A</span><span>RAG Assistant</span></div>',
+            f'<div class="auth-dialog-copy">Delete "{html.escape(title)}"? '
+            "This can't be undone.</div>",
             unsafe_allow_html=True,
         )
+        cancel_col, delete_col = st.columns(2)
+        with cancel_col:
+            if st.button("Cancel", key="cancel_delete_chat", use_container_width=True):
+                st.session_state.confirm_delete_chat_id = None
+                st.rerun()
+        with delete_col:
+            if st.button(
+                "Delete",
+                key="confirm_delete_chat",
+                use_container_width=True,
+                type="primary",
+            ):
+                delete_chat_and_switch(chat_id)
+                st.session_state.confirm_delete_chat_id = None
+                st.rerun()
 
-        if st.button("+  New chat", key="sidebar_new_chat", use_container_width=True):
+    confirm_delete()
+
+
+def render_chat_row_menu(chat_id: str, current_title: str) -> None:
+    with st.popover("⋯", use_container_width=False):
+        new_title = st.text_input(
+            "Rename chat",
+            value=current_title,
+            key=f"rename_input_{chat_id}",
+        )
+        if st.button("Save name", key=f"rename_save_{chat_id}", use_container_width=True):
+            clean_title = new_title.strip() or "New chat"
+            update_chat_title(chat_id, clean_title, _current_user_id())
+            st.session_state.chats[chat_id]["title"] = clean_title
+            st.rerun()
+        if st.button("Delete chat", key=f"delete_trigger_{chat_id}", use_container_width=True):
+            st.session_state.confirm_delete_chat_id = chat_id
+            st.rerun()
+
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        with st.container(key="sidebar_header_row"):
+            logo_col, toggle_col = st.columns([0.78, 0.22])
+            with logo_col:
+                st.markdown(
+                    '<div class="sb-header"><span class="sb-logo">A</span><span>RAG Assistant</span></div>',
+                    unsafe_allow_html=True,
+                )
+            with toggle_col:
+                if st.button("«", key="sidebar_collapse_toggle", help="Collapse sidebar"):
+                    st.session_state.sidebar_collapsed = True
+                    st.rerun()
+
+        if st.button("✎  New chat", key="sidebar_new_chat", use_container_width=True):
             create_new_chat()
             st.rerun()
 
-        if st.button("Re-index documents", key="sidebar_reindex_docs", use_container_width=True):
+        stats_active = st.session_state.active_view == "stats"
+        with st.container(key="recent_active_chat" if stats_active else "sidebar_stats_row"):
+            if st.button("📊  Stats", key="sidebar_stats_nav", use_container_width=True):
+                st.session_state.active_view = "stats"
+                st.rerun()
+
+        if st.button("⟳  Re-index documents", key="sidebar_reindex_docs", use_container_width=True):
             st.session_state.needs_reindex = True
             st.rerun()
 
-        st.markdown('<div class="sb-section-title">Recents</div>', unsafe_allow_html=True)
+        with st.container(key="sidebar_search"):
+            st.session_state.chat_search = st.text_input(
+                "Search chats",
+                value=st.session_state.chat_search,
+                key="chat_search_input",
+                placeholder="Search chats",
+                label_visibility="collapsed",
+            )
 
         chats_sorted = sorted(
             st.session_state.chats.values(),
@@ -1112,10 +1266,15 @@ def render_sidebar() -> None:
             reverse=True,
         )
 
+        search_query = st.session_state.chat_search.strip().lower()
+        if search_query:
+            st.markdown('<div class="sb-section-title">Search results</div>', unsafe_allow_html=True)
+
         with st.container(key="recents_list"):
-            visible_recent_limit = 6
+            visible_recent_limit = 50 if not search_query else 20
             shown = 0
             title_counts: Dict[str, int] = {}
+            current_bucket = None
             for chat in chats_sorted:
                 first_user = next(
                     (
@@ -1127,7 +1286,20 @@ def render_sidebar() -> None:
                 )
                 if not first_user:
                     continue
-                title = _chat_title_from_question(first_user)
+                stored_title = chat.get("title") or "New chat"
+                title = (
+                    stored_title
+                    if stored_title != "New chat"
+                    else _chat_title_from_question(first_user)
+                )
+
+                if search_query:
+                    haystack = " ".join(
+                        [title] + [m.get("content", "") for m in chat.get("messages", [])]
+                    ).lower()
+                    if search_query not in haystack:
+                        continue
+
                 title_counts[title] = title_counts.get(title, 0) + 1
                 display_title = (
                     f"{title} {title_counts[title]}"
@@ -1137,18 +1309,38 @@ def render_sidebar() -> None:
                 if shown >= visible_recent_limit:
                     break
 
+                if not search_query:
+                    bucket = _date_bucket(chat.get("created_at", ""))
+                    if bucket != current_bucket:
+                        st.markdown(
+                            f'<div class="sb-date-group">{bucket}</div>',
+                            unsafe_allow_html=True,
+                        )
+                        current_bucket = bucket
+
                 chat_id = chat["id"]
-                is_active = chat_id == st.session_state.current_chat_id
+                is_active = (
+                    chat_id == st.session_state.current_chat_id
+                    and st.session_state.active_view == "chat"
+                )
                 row_key = "recent_active_chat" if is_active else f"recent_chat_{chat_id}"
                 with st.container(key=row_key):
-                    if st.button(
-                        display_title,
-                        key=f"switch_chat_{chat_id}",
-                        use_container_width=True,
-                    ):
-                        switch_chat(chat_id)
-                        st.rerun()
+                    switch_col, menu_col = st.columns([0.82, 0.18], gap="small")
+                    with switch_col:
+                        if st.button(
+                            display_title,
+                            key=f"switch_chat_{chat_id}",
+                            use_container_width=True,
+                        ):
+                            switch_chat(chat_id)
+                            st.rerun()
+                    with menu_col:
+                        with st.container(key=f"chat_row_menu_{chat_id}"):
+                            render_chat_row_menu(chat_id, chat.get("title", display_title))
                 shown += 1
+
+            if search_query and shown == 0:
+                st.caption("No chats match your search.")
 
         with st.container(key="profile_area"):
             user = get_current_user() or {}
@@ -1169,22 +1361,83 @@ def render_sidebar() -> None:
                 st.rerun()
 
 
-def render_chat() -> None:
-    if not st.session_state.messages:
-        st.markdown(
-            """
-            <div class="empty-state">
-                <div class="empty-title">How can I help you today?</div>
-                <div class="empty-sub">Upload PDFs below and ask questions about them.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+def render_top_header() -> None:
+    if not st.session_state.sidebar_collapsed:
+        return
+    with st.container(key="app_header"):
+        toggle_col, title_col = st.columns([0.08, 0.92])
+        with toggle_col:
+            if st.button("☰", key="sidebar_expand_toggle", help="Expand sidebar"):
+                st.session_state.sidebar_collapsed = False
+                st.rerun()
+        with title_col:
+            if st.session_state.active_view == "stats":
+                title = "Stats"
+            else:
+                current_chat = st.session_state.chats.get(st.session_state.current_chat_id) or {}
+                title = current_chat.get("title") or "New chat"
+            st.markdown(
+                f'<div class="app-header-title">{html.escape(title)}</div>',
+                unsafe_allow_html=True,
+            )
+
+
+STARTER_PROMPTS = [
+    "Summarize this document",
+    "What are the key takeaways?",
+    "List any important dates or deadlines",
+    "Who or what is mentioned most?",
+]
+
+
+def render_empty_state() -> None:
+    has_docs = bool(st.session_state.uploaded_pdfs)
+    subtitle = (
+        "Ask anything about your uploaded documents."
+        if has_docs
+        else "Upload a PDF below and ask anything about it."
+    )
+    st.markdown(
+        f"""
+        <div class="empty-state">
+            <div class="empty-title">What can I help with?</div>
+            <div class="empty-sub">{subtitle}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not has_docs:
         return
 
-    for message in st.session_state.messages:
+    with st.container(key="starter_prompts"):
+        cols = st.columns(len(STARTER_PROMPTS), gap="small")
+        for index, (col, prompt) in enumerate(zip(cols, STARTER_PROMPTS)):
+            with col:
+                if st.button(prompt, key=f"starter_{index}", use_container_width=True):
+                    st.session_state.pending_user_question = prompt
+                    st.rerun()
+
+
+def render_chat() -> None:
+    if not st.session_state.messages:
+        render_empty_state()
+        return
+
+    last_assistant_index = None
+    for index, message in enumerate(st.session_state.messages):
+        if message["role"] == "assistant":
+            last_assistant_index = index
+
+    for index, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             render_message_content(message["role"], message["content"])
+            if message["role"] == "assistant":
+                render_message_actions(
+                    message["content"],
+                    message_index=index,
+                    show_regenerate=(index == last_assistant_index),
+                )
 
 
 def _split_answer_sources(content: str) -> Dict[str, str]:
@@ -1206,21 +1459,104 @@ def _split_answer_sources(content: str) -> Dict[str, str]:
 
 def render_message_content(role: str, content: str) -> None:
     if role != "assistant":
-        st.markdown(html.escape(content))
+        st.markdown(content)
         return
 
     parts = _split_answer_sources(content)
-    answer_html = html.escape(parts["answer"]).replace("\n", "<br>")
-    sources_html = html.escape(parts["sources"]).replace("\n", "<br>")
-    st.markdown(
-        f'<div class="assistant-answer">{answer_html}</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(parts["answer"])
     if parts["sources"]:
+        sources_html = html.escape(parts["sources"]).replace("\n", "<br>")
         st.markdown(
-            f'<div class="assistant-sources"><strong>Sources:</strong> {sources_html}</div>',
+            f'<div class="assistant-sources"><strong>Sources</strong>{sources_html}</div>',
             unsafe_allow_html=True,
         )
+
+
+def render_copy_button(text: str, key: str) -> None:
+    payload = json.dumps(text)
+    components.html(
+        f"""
+        <style>html, body {{ margin:0; padding:0; background:transparent; }}</style>
+        <button id="{key}" title="Copy"
+          style="background:transparent;border:none;color:#8b8b8b;cursor:pointer;
+                 font-size:14px;padding:3px 8px;border-radius:6px;line-height:1.4;
+                 font-family:inherit;">⧉ Copy</button>
+        <script>
+          const btn = document.getElementById("{key}");
+          async function copyText(text) {{
+            try {{
+              await navigator.clipboard.writeText(text);
+              return true;
+            }} catch (err) {{
+              try {{
+                const ta = document.createElement("textarea");
+                ta.value = text;
+                ta.style.position = "fixed";
+                ta.style.opacity = "0";
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+                document.execCommand("copy");
+                document.body.removeChild(ta);
+                return true;
+              }} catch (err2) {{
+                return false;
+              }}
+            }}
+          }}
+          btn.addEventListener("click", async () => {{
+            const ok = await copyText({payload});
+            btn.textContent = ok ? "✓ Copied" : "Copy failed";
+            btn.style.color = ok ? "#22c55e" : "#ef4444";
+            setTimeout(() => {{ btn.textContent = "⧉ Copy"; btn.style.color = "#8b8b8b"; }}, 1500);
+          }});
+        </script>
+        """,
+        height=30,
+    )
+
+
+def render_message_actions(content: str, message_index: int, show_regenerate: bool) -> None:
+    parts = _split_answer_sources(content)
+    with st.container(key=f"msg_actions_{message_index}"):
+        cols = st.columns([0.18, 0.32, 0.50] if show_regenerate else [0.18, 0.82])
+        with cols[0]:
+            render_copy_button(parts["answer"], key=f"copy_btn_{message_index}")
+        if show_regenerate:
+            with cols[1]:
+                if st.button(
+                    "↻ Regenerate",
+                    key=f"regen_{message_index}",
+                    disabled=st.session_state.get("is_responding", False),
+                ):
+                    regenerate_last_response()
+                    st.rerun()
+
+
+def regenerate_last_response() -> None:
+    messages = st.session_state.messages
+    last_assistant_pos = None
+    for pos in range(len(messages) - 1, -1, -1):
+        if messages[pos]["role"] == "assistant":
+            last_assistant_pos = pos
+            break
+    if last_assistant_pos is None:
+        return
+
+    last_user_question = None
+    for pos in range(last_assistant_pos - 1, -1, -1):
+        if messages[pos]["role"] == "user":
+            last_user_question = messages[pos]["content"]
+            break
+    if last_user_question is None:
+        return
+
+    removed = messages.pop(last_assistant_pos)
+    message_id = removed.get("id")
+    if message_id:
+        delete_message(message_id, _current_user_id())
+    _persist_current_chat()
+    st.session_state.regenerate_question = last_user_question
 
 
 def render_pdf_chips() -> None:
@@ -1228,35 +1564,61 @@ def render_pdf_chips() -> None:
     if not pdfs:
         return
 
-    with st.container(key="pdf_chips_area"):
-        for filename in pdfs:
+    with st.container(key="active_docs_bar"):
+        chip_cols = st.columns(len(pdfs), gap="small")
+        for filename, col in zip(pdfs, chip_cols):
             digest = hashlib.md5(filename.encode("utf-8")).hexdigest()[:10]
-            with st.container(key=f"pdf_chip_{digest}"):
-                st.markdown(
-                    f"""
-                    <div class="pdf-chip-label">
-                        <span>📄</span>
-                        <span class="pdf-chip-name">{html.escape(filename)}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                if st.button(
-                    "×",
-                    key=f"remove_pdf_{digest}",
-                    help=f"Remove {filename}",
-                ):
-                    remove_pdf(filename)
-                    st.rerun()
+            with col:
+                with st.container(key=f"pdf_chip_{digest}"):
+                    st.markdown(
+                        f"""
+                        <div class="pdf-chip-label">
+                            <span>📄</span>
+                            <span class="pdf-chip-name">{html.escape(filename)}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(
+                        "×",
+                        key=f"remove_pdf_{digest}",
+                        help=f"Remove {filename}",
+                    ):
+                        remove_pdf(filename)
+                        st.rerun()
 
 
-def queue_user_question(input_key: str) -> None:
-    question = st.session_state.get(input_key, "").strip()
-    if question:
-        st.session_state.pending_user_question = question
+def _stream_and_save_answer(
+    question: str,
+    previous_messages: List[Dict[str, str]],
+) -> None:
+    """Stream a fresh assistant answer for `question` into the current chat."""
+    active_index_path = st.session_state.chats[st.session_state.current_chat_id].get(
+        "active_index_path"
+    )
+    with st.chat_message("assistant"):
+        full_answer = st.write_stream(
+            stream_conversational_rag_chain(
+                question,
+                active_index_path,
+                chat_messages=previous_messages,
+            )
+        )
+
+    saved_assistant_msg = save_message(
+        st.session_state.current_chat_id,
+        "assistant",
+        full_answer,
+        _current_user_id(),
+    )
+    st.session_state.messages.append(saved_assistant_msg)
+    _persist_current_chat()
 
 
 def handle_pending_question() -> bool:
+    if st.session_state.get("is_responding"):
+        return False
+
     user_question = st.session_state.get("pending_user_question")
     if not user_question:
         return False
@@ -1266,89 +1628,212 @@ def handle_pending_question() -> bool:
         st.info("Upload at least one PDF to ask questions.")
         return False
 
-    previous_messages = list(st.session_state.messages)
-    st.session_state.messages.append({"role": "user", "content": user_question})
-    save_message(
-        st.session_state.current_chat_id,
-        "user",
-        user_question,
-        _current_user_id(),
-    )
-    _persist_current_chat()
+    st.session_state.is_responding = True
+    try:
+        previous_messages = list(st.session_state.messages)
+        saved_user_msg = save_message(
+            st.session_state.current_chat_id,
+            "user",
+            user_question,
+            _current_user_id(),
+        )
+        st.session_state.messages.append(saved_user_msg)
+        _persist_current_chat()
 
-    render_chat()
+        render_chat()
+        _stream_and_save_answer(user_question, previous_messages)
+    finally:
+        st.session_state.is_responding = False
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            response = _ask_current_chat(
-                user_question,
-                st.session_state.chats[st.session_state.current_chat_id].get(
-                    "active_index_path"
-                ),
-                previous_messages,
-            )
-        render_message_content("assistant", response)
-
-    st.session_state.messages.append({"role": "assistant", "content": response})
-    save_message(
-        st.session_state.current_chat_id,
-        "assistant",
-        response,
-        _current_user_id(),
-    )
-    _persist_current_chat()
-    st.session_state.chat_text_key += 1
     st.rerun()
+    return True
 
 
-def render_input_area() -> None:
-    text_key = f"chat_text_{st.session_state.chat_text_key}"
-    with st.container(key="input_panel"):
-        render_pdf_chips()
+def handle_regenerate() -> bool:
+    if st.session_state.get("is_responding"):
+        return False
 
-        with st.container(key="input_bar"):
-            upload_col, text_col, send_col = st.columns([0.08, 0.84, 0.08], gap="small")
-            with upload_col:
-                uploaded = st.file_uploader(
-                    "Upload PDFs",
-                    type=["pdf"],
-                    accept_multiple_files=True,
-                    key=f"pdf_uploader_{st.session_state.uploader_key}",
-                    label_visibility="collapsed",
-                )
-            with text_col:
-                pending_question = st.text_input(
-                    "Ask about your documents",
-                    key=text_key,
-                    placeholder="Ask about your documents…",
-                    label_visibility="collapsed",
-                    on_change=queue_user_question,
-                    args=(text_key,),
-                )
-            with send_col:
-                send_clicked = st.button("➤", key="chat_send")
+    question = st.session_state.get("regenerate_question")
+    if not question:
+        return False
 
-        if uploaded:
-            saved = save_uploaded_files(uploaded)
-            if saved:
-                 st.rerun()
+    st.session_state.regenerate_question = None
+    st.session_state.is_responding = True
+    try:
+        previous_messages = list(st.session_state.messages)
+        render_chat()
+        _stream_and_save_answer(question, previous_messages)
+    finally:
+        st.session_state.is_responding = False
 
-        if send_clicked:
-            st.session_state.pending_user_question = pending_question.strip()
+    st.rerun()
+    return True
+
+
+def render_input_area():
+    """Render the chat_input widget and return its raw submission (or None).
+
+    Must be called before any `unsafe_allow_html` markup is injected earlier
+    in the script — Streamlit's chat_input auto-resize measurement breaks
+    (renders ~260px tall) if raw HTML was rendered before it on the same run.
+    """
+    return st.chat_input(
+        "Message RAG Assistant…",
+        key="chat_input_main",
+        accept_file="multiple",
+        file_type=["pdf"],
+        disabled=st.session_state.get("is_responding", False),
+    )
+
+
+def handle_input_submission(submission) -> None:
+    if not submission:
+        return
+
+    files = list(submission.files or [])
+    text = (submission.text or "").strip()
+
+    reindex_triggered = False
+    if files:
+        reindex_triggered = save_uploaded_files(files)
+
+    if (
+        text
+        and not st.session_state.get("is_responding")
+        and not st.session_state.get("pending_user_question")
+    ):
+        st.session_state.pending_user_question = text
+        st.rerun()
+    elif reindex_triggered:
+        st.rerun()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_trace_stats(mtime: float, size: int) -> Dict[str, Any]:
+    """Cached on the trace file's (mtime, size) so it only re-parses on change."""
+    return aggregate_usage_stats(read_trace_events())
+
+
+def _format_percent(value: Optional[float]) -> str:
+    return f"{value * 100:.1f}%" if value is not None else "—"
+
+
+def _format_seconds(value: Optional[float]) -> str:
+    return f"{value:.2f}s" if value is not None else "—"
+
+
+def render_stats_view() -> None:
+    back_col, title_col = st.columns([0.15, 0.85])
+    with back_col:
+        if st.button("← Back", key="stats_back", use_container_width=True):
+            st.session_state.active_view = "chat"
             st.rerun()
+    with title_col:
+        st.markdown('<div class="stats-title">Stats</div>', unsafe_allow_html=True)
+
+    user_id = _current_user_id()
+    usage_counts = get_usage_counts(user_id)
+    activity = get_message_activity(user_id, days=30)
+    mtime, size = trace_file_fingerprint()
+    usage_stats = _cached_trace_stats(mtime, size)
+
+    st.markdown('<div class="sb-section-title">Usage</div>', unsafe_allow_html=True)
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Chats", usage_counts["chat_count"])
+    k2.metric("Messages", usage_counts["message_count"])
+    k3.metric("Documents indexed", usage_counts["document_count"])
+
+    st.markdown('<div class="sb-section-title">Performance &amp; cost</div>', unsafe_allow_html=True)
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Traced queries", usage_stats["total_queries"])
+    p2.metric("Avg response time", _format_seconds(usage_stats["avg_latency_seconds"]))
+    cost = usage_stats["estimated_cost_usd"]
+    p3.metric("Estimated cost to date", f"${cost:.4f}" if cost is not None else "—")
+
+    if activity:
+        activity_df = pd.DataFrame(activity).set_index("date")
+        st.markdown(
+            '<div class="sb-section-title">Messages per day (last 30 days)</div>',
+            unsafe_allow_html=True,
+        )
+        st.bar_chart(activity_df["count"], height=220)
+    else:
+        st.markdown('<div class="stats-caption">No message activity yet.</div>', unsafe_allow_html=True)
+
+    daily_series = usage_stats["daily_series"]
+    if daily_series:
+        cost_df = pd.DataFrame(daily_series).set_index("date")
+        st.markdown(
+            '<div class="sb-section-title">Estimated cost per day</div>',
+            unsafe_allow_html=True,
+        )
+        st.line_chart(cost_df["cost_usd"], height=220)
+
+    st.markdown('<div class="sb-section-title">Retrieval quality</div>', unsafe_allow_html=True)
+    q1, q2 = st.columns(2)
+    q1.metric(
+        "Fallback rate",
+        _format_percent(usage_stats["fallback_rate"]),
+        help="Share of answers where the assistant couldn't find the info in your documents.",
+    )
+    avg_rerank = usage_stats["avg_rerank_score"]
+    q2.metric("Avg rerank score", f"{avg_rerank:.2f}" if avg_rerank is not None else "—")
+
+    st.markdown('<div class="sb-section-title">Evaluation snapshot</div>', unsafe_allow_html=True)
+    summary = read_eval_summary()
+    if not summary:
+        st.markdown(
+            '<div class="stats-caption">No evaluation run yet. '
+            'Run <code>python -m evaluation.run_eval</code> to generate one.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        metrics = summary.get("metrics", {})
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Citation coverage", _format_percent(metrics.get("citation_coverage")))
+        e2.metric("Source-match accuracy", _format_percent(metrics.get("source_match_accuracy")))
+        e3.metric("Failure rate", _format_percent(metrics.get("failure_rate")))
+        e4, e5 = st.columns(2)
+        e4.metric("Avg eval latency", _format_seconds(metrics.get("average_latency_seconds")))
+        avg_words = metrics.get("average_answer_length_words")
+        e5.metric("Avg answer length", f"{avg_words:.1f} words" if avg_words is not None else "—")
+
+        generated_at = summary.get("_generated_at", "")
+        display_time = generated_at[:19].replace("T", " ") if generated_at else "unknown"
+        st.markdown(
+            f'<div class="stats-caption">As of last eval run: {html.escape(display_time)} · '
+            "re-run <code>python -m evaluation.run_eval</code> to refresh.</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def main() -> None:
     init_session_state()
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    # chat_input must be the first widget rendered — see render_input_area's
+    # docstring for why. It's a no-op on the stats page (nothing to submit).
+    show_composer = st.session_state.active_view != "stats"
+    submission = render_input_area() if show_composer else None
+
+    st.markdown(build_custom_css(st.session_state.sidebar_collapsed), unsafe_allow_html=True)
     render_sidebar()
     if st.session_state.show_auth_dialog:
         render_sign_in_dialog()
+    if st.session_state.confirm_delete_chat_id:
+        render_delete_chat_dialog()
     if st.session_state.needs_reindex:
         safe_reindex()
-    if not handle_pending_question():
+
+    render_top_header()
+
+    if st.session_state.active_view == "stats":
+        render_stats_view()
+        return
+
+    render_pdf_chips()
+    if not handle_pending_question() and not handle_regenerate():
         render_chat()
-    render_input_area()
+    handle_input_submission(submission)
 
 
 if __name__ == "__main__":
